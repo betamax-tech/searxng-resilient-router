@@ -59,6 +59,13 @@ const (
 
 var deadletterDir = envOr("DEADLETTER_DIR", "/home/cmark/server/searxng-rotation/cache/deadletter")
 
+// defaultDirectOnly pins ALL searches to the direct tier (no proxy spillover)
+// when ROUTER_DIRECT_ONLY is truthy. Per-request ?direct= overrides this.
+var defaultDirectOnly = func() bool {
+	v := os.Getenv("ROUTER_DIRECT_ONLY")
+	return v == "1" || v == "true" || v == "yes"
+}()
+
 // ------------------------------------------------------------------ state
 var (
 	directInflight int64        // atomic
@@ -209,20 +216,44 @@ func tryTier(name, base string, params url.Values, timeout time.Duration) []byte
 
 func handleSearch(params url.Values) (int, []byte) {
 	query := params.Get("q")
-	// Tier 1: direct (rate + concurrency gated)
-	if ok, reason := tryAcquireDirect(); ok {
+
+	// Direct-only mode: pin to the direct instance, never spill to the proxied
+	// (rotating-IP) tier. Use when the caller must keep a session on ONE
+	// consistent egress IP. Triggered per-request via ?direct=true (or 1/yes)
+	// or globally via ROUTER_DIRECT_ONLY=true. The `direct` param is stripped
+	// before forwarding so it never reaches SearXNG.
+	directOnly := defaultDirectOnly
+	if v := params.Get("direct"); v != "" {
+		directOnly = v == "1" || v == "true" || v == "yes"
+		params.Del("direct")
+	}
+
+	// Tier 1: direct
+	if directOnly {
+		// Bypass the concurrency/rate gate's spillover semantics: in direct-only
+		// mode we always use direct (still honoring the cooldown to avoid
+		// hammering a rate-limited engine), because there is no fallback tier.
 		body := tryTier("direct", direct, params, directTimeout)
-		releaseDirect()
 		if body != nil {
 			return http.StatusOK, body
 		}
+		log.Printf("  direct-only: direct tier failed -> dead-letter (no proxy spill)")
 	} else {
-		log.Printf("  direct tier skipped (%s) -> spilling to proxied", reason)
-	}
+		// Normal mode: rate + concurrency gated, spills to proxied on pressure.
+		if ok, reason := tryAcquireDirect(); ok {
+			body := tryTier("direct", direct, params, directTimeout)
+			releaseDirect()
+			if body != nil {
+				return http.StatusOK, body
+			}
+		} else {
+			log.Printf("  direct tier skipped (%s) -> spilling to proxied", reason)
+		}
 
-	// Tier 2: proxied
-	if body := tryTier("proxied", proxied, params, proxiedTimeout); body != nil {
-		return http.StatusOK, body
+		// Tier 2: proxied
+		if body := tryTier("proxied", proxied, params, proxiedTimeout); body != nil {
+			return http.StatusOK, body
+		}
 	}
 
 	// Tier 3: dead-letter — never drop the query
@@ -300,6 +331,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		"direct_rate_tokens":     int(directBucket.Available()),
 		"direct_rate_burst":      rateBurst,
 		"direct_rate_per_min":    rateRefillRate * 60,
+		"default_direct_only":    defaultDirectOnly,
 	}
 	b, _ := json.Marshal(state)
 	writeJSON(w, http.StatusOK, b)
