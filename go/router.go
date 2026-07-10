@@ -269,7 +269,7 @@ func tryTier(name, base string, params url.Values, timeout time.Duration) []byte
 	return nil
 }
 
-func handleSearch(params url.Values) (int, []byte) {
+func handleSearch(params url.Values, strict bool) (int, []byte) {
 	query := params.Get("q")
 
 	// Direct-only mode: pin to the direct instance, never spill to the proxied
@@ -340,18 +340,42 @@ func handleSearch(params url.Values) (int, []byte) {
 		}
 	}
 
-	// Tier 3: dead-letter — never drop the query
+	// Tier 3: dead-letter — never drop the query.
+	//
+	// IMPORTANT: respond AS SEARXNG — a real SearXNG returns HTTP 200 with a
+	// (possibly empty) results array; it NEVER returns 5xx for "no results".
+	// Open WebUI's builtin searxng engine calls response.raise_for_status(), so a
+	// 503 here would raise and break web_search. We therefore return 200 with a
+	// SearXNG-shaped empty-results body (extra router_* keys are ignored by
+	// SearXNG parsers). The query is still persisted for background retry.
+	//
+	// Callers that WANT the hard failure signal (e.g. to trigger their own
+	// fallback) can opt in with header `X-Router-Strict: 1`, which restores the
+	// 503 + queued_for_retry envelope.
 	id := deadLetter(query)
-	log.Printf("  ALL TIERS FAILED -> dead-lettered as %s", id)
+	log.Printf("  ALL TIERS FAILED -> dead-lettered as %s (returning 200 empty, SearXNG-compatible)", id)
 	env := map[string]any{
-		"query":          query,
-		"results":        []any{},
-		"router_status":  "queued_for_retry",
-		"detail":         "all live search tiers failed; query persisted for retry",
-		"deadletter_id":  id,
+		"query":                query,
+		"number_of_results":    0,
+		"results":              []any{},
+		"answers":              []any{},
+		"corrections":          []any{},
+		"infoboxes":            []any{},
+		"suggestions":          []any{},
+		"unresponsive_engines": []any{},
+		// router diagnostics (non-SearXNG keys; ignored by SearXNG parsers)
+		"router_status": "queued_for_retry",
+		"deadletter_id": id,
 	}
-	b, _ := json.Marshal(env)
-	return http.StatusServiceUnavailable, b
+	if strict {
+		return http.StatusServiceUnavailable, mustJSON(env)
+	}
+	return http.StatusOK, mustJSON(env)
+}
+
+func mustJSON(v any) []byte {
+	b, _ := json.Marshal(v)
+	return b
 }
 
 var dlMu sync.Mutex
@@ -401,8 +425,12 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, []byte(`{"error":"missing q"}`))
 		return
 	}
+	// Opt-in strict mode: return 503 on total failure instead of a SearXNG-shaped
+	// 200 empty. Header `X-Router-Strict: 1` or `?strict=1`.
+	strict := r.Header.Get("X-Router-Strict") == "1" || params.Get("strict") == "1"
+	params.Del("strict")
 	log.Printf("search q=%q categories=%q", params.Get("q"), params.Get("categories"))
-	status, body := handleSearch(params)
+	status, body := handleSearch(params, strict)
 	writeJSON(w, status, body)
 }
 
