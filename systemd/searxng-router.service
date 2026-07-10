@@ -1,0 +1,17 @@
+[Unit]
+Description=SearXNG front-door search router (direct -> proxied -> dead-letter)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/cmark/server/searxng-rotation/go/searxng-router
+WorkingDirectory=/home/cmark/server/searxng-rotation
+Restart=always
+RestartSec=3
+# Resource guards (host is RAM-tight)
+MemoryMax=64M
+Environment=DEADLETTER_DIR=/home/cmark/server/searxng-rotation/cache/deadletter
+
+[Install]
+WantedBy=default.target

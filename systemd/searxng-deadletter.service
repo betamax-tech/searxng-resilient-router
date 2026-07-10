@@ -1,0 +1,8 @@
+[Unit]
+Description=Retry dead-lettered search queries through the router
+After=searxng-router.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/cmark/server/searxng-rotation/go
+ExecStart=/home/cmark/server/searxng-rotation/go/deadletter-retry

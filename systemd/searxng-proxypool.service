@@ -1,0 +1,11 @@
+[Unit]
+Description=SearXNG proxy pool refresh (incremental self-healing) + reload proxied instance
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/cmark/server/searxng-rotation/go
+ExecStart=/home/cmark/server/searxng-rotation/go/proxypool
+# Reload the proxied SearXNG so it picks up the regenerated proxy list.
+ExecStartPost=/usr/bin/docker compose -f /home/cmark/server/searxng-rotation/searxng/docker-compose.yml restart searxng-proxied

@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh SearXNG proxy pool periodically
+
+[Timer]
+# 5 min after boot, then every 30 min. Incremental design keeps each run cheap.
+OnBootSec=5min
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

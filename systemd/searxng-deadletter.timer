@@ -1,0 +1,11 @@
+[Unit]
+Description=Retry dead-lettered search queries periodically
+
+[Timer]
+# 10 min after boot, then every 15 min. Recovers queries that failed all tiers.
+OnBootSec=10min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
