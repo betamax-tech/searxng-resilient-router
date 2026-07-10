@@ -32,6 +32,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,7 +40,7 @@ import (
 
 // ------------------------------------------------------------------ config
 const (
-	listenAddr = "127.0.0.1:8899"
+	listenPort = "8899"
 	direct     = "http://127.0.0.1:8890"
 	proxied    = "http://127.0.0.1:8891"
 
@@ -154,8 +155,12 @@ func tripCooldown() {
 
 // upstreamSearch queries a SearXNG instance. Returns (status, body, resultCount).
 // resultCount = -1 when the body can't be parsed as a results envelope.
-func upstreamSearch(ctx context.Context, base, query string) (int, []byte, int) {
-	u := base + "/search?" + url.Values{"q": {query}, "format": {"json"}}.Encode()
+// It forwards the caller's full parameter set (categories, pageno, language,
+// safesearch, …) unchanged, only forcing format=json and ensuring q is present.
+func upstreamSearch(ctx context.Context, base string, params url.Values) (int, []byte, int) {
+	q := cloneValues(params)
+	q.Set("format", "json")
+	u := base + "/search?" + q.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return 0, nil, -1
@@ -177,10 +182,20 @@ func upstreamSearch(ctx context.Context, base, query string) (int, []byte, int) 
 	return resp.StatusCode, body, n
 }
 
-func tryTier(name, base, query string, timeout time.Duration) []byte {
+func cloneValues(v url.Values) url.Values {
+	out := make(url.Values, len(v))
+	for k, vals := range v {
+		cp := make([]string, len(vals))
+		copy(cp, vals)
+		out[k] = cp
+	}
+	return out
+}
+
+func tryTier(name, base string, params url.Values, timeout time.Duration) []byte {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	status, body, n := upstreamSearch(ctx, base, query)
+	status, body, n := upstreamSearch(ctx, base, params)
 	if name == "direct" && (status == http.StatusTooManyRequests || status == http.StatusForbidden) {
 		tripCooldown()
 	}
@@ -192,10 +207,11 @@ func tryTier(name, base, query string, timeout time.Duration) []byte {
 	return nil
 }
 
-func handleSearch(query string) (int, []byte) {
+func handleSearch(params url.Values) (int, []byte) {
+	query := params.Get("q")
 	// Tier 1: direct (rate + concurrency gated)
 	if ok, reason := tryAcquireDirect(); ok {
-		body := tryTier("direct", direct, query, directTimeout)
+		body := tryTier("direct", direct, params, directTimeout)
 		releaseDirect()
 		if body != nil {
 			return http.StatusOK, body
@@ -205,7 +221,7 @@ func handleSearch(query string) (int, []byte) {
 	}
 
 	// Tier 2: proxied
-	if body := tryTier("proxied", proxied, query, proxiedTimeout); body != nil {
+	if body := tryTier("proxied", proxied, params, proxiedTimeout); body != nil {
 		return http.StatusOK, body
 	}
 
@@ -242,32 +258,36 @@ func deadLetter(query string) string {
 }
 
 // ------------------------------------------------------------------ http
-func extractQuery(r *http.Request) string {
+// extractParams returns the caller's full SearXNG parameter set. GET uses the
+// query string directly; POST accepts JSON {"q":...} or form-encoded bodies.
+func extractParams(r *http.Request) url.Values {
 	if r.Method == http.MethodPost {
 		defer r.Body.Close()
 		raw, _ := io.ReadAll(r.Body)
-		var j struct {
-			Q string `json:"q"`
-		}
-		if json.Unmarshal(raw, &j) == nil && j.Q != "" {
-			return j.Q
+		var j map[string]any
+		if json.Unmarshal(raw, &j) == nil && len(j) > 0 {
+			v := url.Values{}
+			for k, val := range j {
+				v.Set(k, fmt.Sprintf("%v", val))
+			}
+			return v
 		}
 		if v, err := url.ParseQuery(string(raw)); err == nil {
-			return v.Get("q")
+			return v
 		}
-		return ""
+		return url.Values{}
 	}
-	return r.URL.Query().Get("q")
+	return r.URL.Query()
 }
 
 func searchHandler(w http.ResponseWriter, r *http.Request) {
-	query := extractQuery(r)
-	if query == "" {
+	params := extractParams(r)
+	if params.Get("q") == "" {
 		writeJSON(w, http.StatusBadRequest, []byte(`{"error":"missing q"}`))
 		return
 	}
-	log.Printf("search q=%q", query)
-	status, body := handleSearch(query)
+	log.Printf("search q=%q categories=%q", params.Get("q"), params.Get("categories"))
+	status, body := handleSearch(params)
 	writeJSON(w, status, body)
 }
 
@@ -296,13 +316,28 @@ func main() {
 	mux.HandleFunc("/search", searchHandler)
 	mux.HandleFunc("/healthz", healthHandler)
 
-	srv := &http.Server{
-		Addr:              listenAddr,
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
+	// Bind loopback (host-side tools) + docker bridge gateway (containers reach
+	// via host.docker.internal). Extra bind addrs can be set via ROUTER_BIND_ADDRS
+	// (comma-separated host:port). Never bound to a public interface.
+	binds := []string{"127.0.0.1:" + listenPort, "172.17.0.1:" + listenPort}
+	if env := os.Getenv("ROUTER_BIND_ADDRS"); env != "" {
+		binds = strings.Split(env, ",")
 	}
-	log.Printf("searxng-router listening on http://%s", listenAddr)
+
 	log.Printf("  tiers: direct=%s (max %d) -> proxied=%s -> dead-letter", direct, directMax, proxied)
+	errCh := make(chan error, len(binds))
+	for _, addr := range binds {
+		addr := addr
+		srv := &http.Server{
+			Addr:              addr,
+			Handler:           mux,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		go func() {
+			log.Printf("searxng-router listening on http://%s", addr)
+			errCh <- srv.ListenAndServe()
+		}()
+	}
 	fmt.Fprintln(os.Stderr, "ready")
-	log.Fatal(srv.ListenAndServe())
+	log.Fatal(<-errCh)
 }

@@ -110,11 +110,30 @@ loginctl enable-linger "$USER"
 ```
 
 ### 7. Point your research tools at the router
-Set the SearXNG endpoint to **`http://127.0.0.1:8899`** (the router), not the
-raw instances. For the OpenCode `local-researcher` MCP:
+Set the SearXNG endpoint to the **router**, not the raw instances. The router
+binds both `127.0.0.1:8899` (host-side tools) and `172.17.0.1:8899` (docker
+bridge, so containers reach it via `host.docker.internal:8899`). It is never
+bound to a public interface.
+
+**OpenCode `local-researcher` MCP** (host-side):
 ```json
 "environment": { "SEARXNG_ENDPOINT": "http://localhost:8899" }
 ```
+
+**Open WebUI `deep_research` / web search** (containerized) — note Open WebUI
+persists this in its DB, which **overrides the env var**, so set both:
+```bash
+# .env
+SEARXNG_QUERY_URL=http://host.docker.internal:8899/search?q=<query>
+```
+```sql
+-- webui.db (config table) — the DB value wins after first admin-panel save
+UPDATE config SET value='"http://host.docker.internal:8899/search?q=<query>"'
+  WHERE key='web.search.searxng_query_url';
+```
+The router forwards the caller's full SearXNG parameter set (`categories`,
+`pageno`, `language`, `safesearch`, …) unchanged, so category routing is
+preserved through the resilience tiers.
 
 ## Verify
 ```bash
