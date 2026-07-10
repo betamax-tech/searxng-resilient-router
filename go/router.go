@@ -49,12 +49,20 @@ const (
 	directTimeout  = 20 * time.Second
 	proxiedTimeout = 45 * time.Second
 
-	// Direct-tier outbound rate limit — protects THIS server's real datacenter IP
-	// (the proxied tier is intentionally NOT rate-limited; rotating IPs absorb it).
-	// Token bucket: sustained 6/min, burst up to 15. Researched safe zone for
-	// Google web scraping from a datacenter IP (exceeding risks a 24h suspension).
-	rateBurst      = 15               // bucket capacity (max burst)
-	rateRefillRate = 6.0 / 60.0       // tokens per second (6 per minute sustained)
+	// PER-IP outbound rate limits. Search engines rate-limit per source IP at
+	// ~6/min from a datacenter IP, so each egress IP gets its own budget:
+	//   - DIRECT  = this server's real IP        -> 6/min, burst 15.
+	//   - PROXIED = pool of N rotating proxy IPs  -> N×6/min aggregate (SearXNG
+	//     spreads proxied requests across all N proxies internally), so total
+	//     sustainable engine load scales with the proxy pool.
+	perIPRate  = 6.0 / 60.0 // tokens/sec per egress IP (6 per minute)
+	perIPBurst = 15         // burst capacity per egress IP
+
+	// When both buckets are dry, a request waits up to this long for a token
+	// before giving up and dead-lettering (bounded latency, never blocks forever).
+	maxWait = 8 * time.Second
+
+	activePoolFile = "/home/cmark/server/searxng-rotation/cache/active_pool.json"
 )
 
 var deadletterDir = envOr("DEADLETTER_DIR", "/home/cmark/server/searxng-rotation/cache/deadletter")
@@ -70,8 +78,39 @@ var defaultDirectOnly = func() bool {
 var (
 	directInflight int64        // atomic
 	cooldownUntil  atomic.Int64 // unix-nano; direct skipped until this time
-	directBucket   = newTokenBucket(rateBurst, rateRefillRate)
+
+	// Direct IP bucket: fixed 6/min, burst 15.
+	directBucket = newTokenBucket(perIPBurst, perIPRate)
+
+	// Proxied-pool bucket: capacity/refill = (proxy count) × per-IP budget,
+	// refreshed periodically from the active proxy pool so it auto-scales as the
+	// pool heals. Starts at 1×IP until the first refresh.
+	proxiedBucket = newTokenBucket(perIPBurst, perIPRate)
 )
+
+// refreshProxiedCapacity resizes the proxied-pool bucket to (proxy count) × the
+// per-IP budget, reading the live pool. Run once at boot + on a ticker.
+func refreshProxiedCapacity() {
+	n := readProxyCount()
+	if n < 1 {
+		n = 1
+	}
+	proxiedBucket.Resize(float64(perIPBurst*n), perIPRate*float64(n))
+}
+
+func readProxyCount() int {
+	b, err := os.ReadFile(activePoolFile)
+	if err != nil {
+		return 1
+	}
+	var doc struct {
+		Count int `json:"count"`
+	}
+	if json.Unmarshal(b, &doc) != nil || doc.Count < 1 {
+		return 1
+	}
+	return doc.Count
+}
 
 // tokenBucket is a lazy (no background goroutine) rate limiter. Tokens refill
 // continuously at refillPerSec up to capacity; TryTake removes one if available.
@@ -119,6 +158,27 @@ func (b *tokenBucket) Available() float64 {
 	return t
 }
 
+// Resize changes capacity + refill rate (e.g. when the proxy pool grows/shrinks),
+// clamping current tokens to the new capacity.
+func (b *tokenBucket) Resize(capacity, refillPerSec float64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.capacity = capacity
+	b.refillRate = refillPerSec
+	if b.tokens > capacity {
+		b.tokens = capacity
+	}
+}
+
+// Refund returns one token (used when a reserved slot won't be consumed).
+func (b *tokenBucket) Refund() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.tokens < b.capacity {
+		b.tokens++
+	}
+}
+
 func envOr(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
@@ -139,12 +199,7 @@ func tryAcquireDirect() (bool, string) {
 	for {
 		n := atomic.LoadInt64(&directInflight)
 		if n >= directMax {
-			// Refund the token we took — we're spilling, not using direct.
-			directBucket.mu.Lock()
-			if directBucket.tokens < directBucket.capacity {
-				directBucket.tokens++
-			}
-			directBucket.mu.Unlock()
+			directBucket.Refund() // spilling, not using direct — give the token back
 			return false, "saturated"
 		}
 		if atomic.CompareAndSwapInt64(&directInflight, n, n+1) {
@@ -239,20 +294,49 @@ func handleSearch(params url.Values) (int, []byte) {
 		}
 		log.Printf("  direct-only: direct tier failed -> dead-letter (no proxy spill)")
 	} else {
-		// Normal mode: rate + concurrency gated, spills to proxied on pressure.
-		if ok, reason := tryAcquireDirect(); ok {
-			body := tryTier("direct", direct, params, directTimeout)
-			releaseDirect()
-			if body != nil {
-				return http.StatusOK, body
+		// Per-IP throttle: prefer direct (its own 6/min IP budget), else the
+		// proxied pool (N×6/min aggregate across N proxy IPs). If BOTH buckets
+		// are momentarily dry, wait up to maxWait for either to refill — this
+		// smooths bursts (e.g. extended_research fan-out) into a sustainable
+		// engine-request rate instead of overwhelming the engines. On timeout,
+		// fall through to dead-letter (bounded latency, never blocks forever).
+		deadline := time.Now().Add(maxWait)
+		waited := false
+		attempted := false // did we actually reach an upstream (vs. only budget-blocked)?
+		for !attempted {
+			// 1. Direct tier (rate + concurrency + cooldown gated).
+			if ok, _ := tryAcquireDirect(); ok {
+				attempted = true
+				body := tryTier("direct", direct, params, directTimeout)
+				releaseDirect()
+				if body != nil {
+					return http.StatusOK, body
+				}
 			}
-		} else {
-			log.Printf("  direct tier skipped (%s) -> spilling to proxied", reason)
-		}
 
-		// Tier 2: proxied
-		if body := tryTier("proxied", proxied, params, proxiedTimeout); body != nil {
-			return http.StatusOK, body
+			// 2. Proxied pool (aggregate IP budget).
+			if proxiedBucket.TryTake() {
+				attempted = true
+				body := tryTier("proxied", proxied, params, proxiedTimeout)
+				if body != nil {
+					return http.StatusOK, body
+				}
+			}
+
+			if attempted {
+				break // an upstream ran but returned nothing -> dead-letter
+			}
+
+			// 3. Both buckets dry and nothing tried yet: wait, up to maxWait.
+			if time.Now().After(deadline) {
+				log.Printf("  throttle: no IP budget within %s -> dead-letter", maxWait)
+				break
+			}
+			if !waited {
+				log.Printf("  throttle: all IP budgets dry, waiting up to %s…", maxWait)
+				waited = true
+			}
+			time.Sleep(250 * time.Millisecond)
 		}
 	}
 
@@ -329,9 +413,13 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		"direct_cooldown_active": time.Now().UnixNano() < cooldownUntil.Load(),
 		"direct_max":             directMax,
 		"direct_rate_tokens":     int(directBucket.Available()),
-		"direct_rate_burst":      rateBurst,
-		"direct_rate_per_min":    rateRefillRate * 60,
+		"direct_rate_burst":      perIPBurst,
+		"direct_rate_per_min":    perIPRate * 60,
 		"default_direct_only":    defaultDirectOnly,
+		"proxy_count":            readProxyCount(),
+		"proxied_rate_tokens":    int(proxiedBucket.Available()),
+		"proxied_rate_per_min":   int(proxiedBucket.refillRate * 60),
+		"max_wait_seconds":       int(maxWait.Seconds()),
 	}
 	b, _ := json.Marshal(state)
 	writeJSON(w, http.StatusOK, b)
@@ -344,6 +432,16 @@ func writeJSON(w http.ResponseWriter, status int, body []byte) {
 }
 
 func main() {
+	// Size the proxied-pool bucket from the live proxy count, then keep it in
+	// sync as the pool heals/shrinks.
+	refreshProxiedCapacity()
+	go func() {
+		t := time.NewTicker(60 * time.Second)
+		for range t.C {
+			refreshProxiedCapacity()
+		}
+	}()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/search", searchHandler)
 	mux.HandleFunc("/healthz", healthHandler)
