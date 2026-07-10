@@ -14,6 +14,19 @@ search:
   formats:
     - html
     - json
+  # Recover suspended engines FAST. Defaults suspend an engine for ~1h on 429
+  # and 24h on CAPTCHA/access-denied — which, with few enabled engines, causes
+  # total failure after a burst (e.g. extended_research fan-out). Shorten these
+  # so a transient block doesn't take an engine offline for the whole session.
+  ban_time_on_fail: 5
+  max_ban_time_on_fail: 120
+  suspended_times:
+    SearxEngineAccessDenied: 300      # was 86400 (24h)
+    SearxEngineCaptcha: 300           # was 86400 (24h)
+    SearxEngineTooManyRequests: 300   # was 3660 (~1h)
+    cf_SearxEngineCaptcha: 600
+    cf_SearxEngineAccessDenied: 300
+    recaptcha_SearxEngineCaptcha: 600
 
 server:
   secret_key: "OVERRIDDEN_BY_SEARXNG_SECRET_ENV"
@@ -29,11 +42,25 @@ ui:
     simple_style: dark
 
 engines:
-  # Google is the most reliable general engine from this host's datacenter IP
-  # (returns relevant results, no CAPTCHA blocking as of the current image).
+  # Multiple general engines enabled so no single engine is a point of failure.
+  # When one gets rate-limited/suspended (e.g. Google after a burst), the others
+  # keep results flowing. Engine reliability drifts over time — re-test with
+  # `&engines=<name>` if one starts failing and flip disabled accordingly.
   - name: google
     engine: google
     shortcut: g
+    disabled: false
+
+  # DuckDuckGo: reliable from this host again; returns highly relevant results.
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    disabled: false
+
+  # Bing: reliable fallback; broad coverage.
+  - name: bing
+    engine: bing
+    shortcut: b
     disabled: false
 
   - name: wikipedia
@@ -44,19 +71,8 @@ engines:
     engine: github
     shortcut: gh
 
-  # --- Disabled: unreliable from this host ---
-  # bing: parser returns query-irrelevant noise in the current image.
-  - name: bing
-    engine: bing
-    shortcut: b
-    disabled: true
-
-  # These CAPTCHA / access-deny this host's datacenter IP. Reachable via !bang if ever needed.
-  - name: duckduckgo
-    engine: duckduckgo
-    shortcut: ddg
-    disabled: true
-
+  # --- Disabled: currently CAPTCHA / access-deny this host's datacenter IP. ---
+  # Reachable via !bang if ever needed; re-enable if they recover.
   - name: brave
     engine: brave
     shortcut: br
