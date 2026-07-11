@@ -370,22 +370,45 @@ func cloneValues(v url.Values) url.Values {
 	return out
 }
 
-func tryTier(name, base string, params url.Values, timeout time.Duration) []byte {
+// tierResult carries everything the analytics needs from one upstream attempt.
+type tierResult struct {
+	body         []byte
+	status       int
+	results      int
+	latencyMS    int64
+	unresponsive []unresponsiveEng
+}
+
+func tryTier(name, base string, params url.Values, timeout time.Duration) tierResult {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	t0 := time.Now()
 	status, body, n := upstreamSearch(ctx, base, params)
+	lat := time.Since(t0).Milliseconds()
 	if name == "direct" && (status == http.StatusTooManyRequests || status == http.StatusForbidden) {
 		tripCooldown()
 	}
+	tr := tierResult{status: status, results: n, latencyMS: lat, unresponsive: parseUnresponsive(body)}
 	if status == http.StatusOK && n > 0 {
 		log.Printf("  %s: OK (%d results)", name, n)
-		return body
+		tr.body = body
+		return tr
 	}
 	log.Printf("  %s: FAIL (status=%d, results=%d)", name, status, n)
-	return nil
+	return tr
 }
 
-func handleSearch(params url.Values, strict bool) (int, []byte) {
+// searchOutcome is the router's result for one query, including metadata the
+// handler surfaces to the caller (headers + additive JSON keys).
+type searchOutcome struct {
+	status       int
+	body         []byte
+	enginesUsed  string            // engines= we asked SearXNG for ("" = defaults)
+	tier         string            // direct | proxied | none
+	unresponsive []unresponsiveEng // engines SearXNG reported down/suspended
+}
+
+func handleSearch(params url.Values, strict bool) searchOutcome {
 	query := params.Get("q")
 
 	// Per-query engine rotation: unless the caller has ALREADY chosen engines,
@@ -401,8 +424,7 @@ func handleSearch(params url.Values, strict bool) (int, []byte) {
 	if !callerChoseEngines {
 		if sel := selectEngines(); sel != "" {
 			params.Set("engines", sel)
-			// engines= and categories= together can over-restrict; let engines win.
-			params.Del("categories")
+			params.Del("categories") // let engines win over categories
 			log.Printf("  engines rotated -> %s", sel)
 		} else {
 			log.Printf("  engines: all budgets spent -> SearXNG defaults")
@@ -410,63 +432,49 @@ func handleSearch(params url.Values, strict bool) (int, []byte) {
 	} else {
 		log.Printf("  engines: caller-specified (bang/param) -> rotation skipped")
 	}
+	enginesUsed := params.Get("engines")
 
-	// Direct-only mode: pin to the direct instance, never spill to the proxied
-	// (rotating-IP) tier. Use when the caller must keep a session on ONE
-	// consistent egress IP. Triggered per-request via ?direct=true (or 1/yes)
-	// or globally via ROUTER_DIRECT_ONLY=true. The `direct` param is stripped
-	// before forwarding so it never reaches SearXNG.
+	// Direct-only mode: pin to the direct instance, never spill to proxied.
 	directOnly := defaultDirectOnly
 	if v := params.Get("direct"); v != "" {
 		directOnly = v == "1" || v == "true" || v == "yes"
 		params.Del("direct")
 	}
 
-	// Tier 1: direct
+	var last tierResult
+
 	if directOnly {
-		// Bypass the concurrency/rate gate's spillover semantics: in direct-only
-		// mode we always use direct (still honoring the cooldown to avoid
-		// hammering a rate-limited engine), because there is no fallback tier.
-		body := tryTier("direct", direct, params, directTimeout)
-		if body != nil {
-			return http.StatusOK, body
+		last = tryTier("direct", direct, params, directTimeout)
+		if last.body != nil {
+			return finishSearch(query, enginesUsed, "direct", last, strict)
 		}
 		log.Printf("  direct-only: direct tier failed -> dead-letter (no proxy spill)")
 	} else {
-		// Per-IP throttle: prefer direct (its own 6/min IP budget), else the
-		// proxied pool (N×6/min aggregate across N proxy IPs). If BOTH buckets
-		// are momentarily dry, wait up to maxWait for either to refill — this
-		// smooths bursts (e.g. extended_research fan-out) into a sustainable
-		// engine-request rate instead of overwhelming the engines. On timeout,
-		// fall through to dead-letter (bounded latency, never blocks forever).
+		// Per-IP throttle: prefer direct (own 6/min IP budget), else proxied pool
+		// (N×6/min across N proxy IPs). If both dry, wait up to maxWait to smooth
+		// bursts, then dead-letter (bounded latency).
 		deadline := time.Now().Add(maxWait)
 		waited := false
-		attempted := false // did we actually reach an upstream (vs. only budget-blocked)?
+		attempted := false
 		for !attempted {
-			// 1. Direct tier (rate + concurrency + cooldown gated).
 			if ok, _ := tryAcquireDirect(); ok {
 				attempted = true
-				body := tryTier("direct", direct, params, directTimeout)
+				last = tryTier("direct", direct, params, directTimeout)
 				releaseDirect()
-				if body != nil {
-					return http.StatusOK, body
+				if last.body != nil {
+					return finishSearch(query, enginesUsed, "direct", last, strict)
 				}
 			}
-
-			// 2. Proxied pool (aggregate IP budget).
 			if proxiedBucket.TryTake() {
 				attempted = true
-				body := tryTier("proxied", proxied, params, proxiedTimeout)
-				if body != nil {
-					return http.StatusOK, body
+				last = tryTier("proxied", proxied, params, proxiedTimeout)
+				if last.body != nil {
+					return finishSearch(query, enginesUsed, "proxied", last, strict)
 				}
 			}
-
 			if attempted {
-				break // an upstream ran but returned nothing -> dead-letter
+				break
 			}
-
-			// 3. Both buckets dry and nothing tried yet: wait, up to maxWait.
 			if time.Now().After(deadline) {
 				log.Printf("  throttle: no IP budget within %s -> dead-letter", maxWait)
 				break
@@ -479,37 +487,51 @@ func handleSearch(params url.Values, strict bool) (int, []byte) {
 		}
 	}
 
-	// Tier 3: dead-letter — never drop the query.
-	//
-	// IMPORTANT: respond AS SEARXNG — a real SearXNG returns HTTP 200 with a
-	// (possibly empty) results array; it NEVER returns 5xx for "no results".
-	// Open WebUI's builtin searxng engine calls response.raise_for_status(), so a
-	// 503 here would raise and break web_search. We therefore return 200 with a
-	// SearXNG-shaped empty-results body (extra router_* keys are ignored by
-	// SearXNG parsers). The query is still persisted for background retry.
-	//
-	// Callers that WANT the hard failure signal (e.g. to trigger their own
-	// fallback) can opt in with header `X-Router-Strict: 1`, which restores the
-	// 503 + queued_for_retry envelope.
+	// Dead-letter — respond AS SEARXNG (HTTP 200 + empty results) so clients that
+	// call raise_for_status() don't break; query persisted for retry. Opt-in
+	// X-Router-Strict / ?strict=1 restores the 503 signal.
 	id := deadLetter(query)
 	log.Printf("  ALL TIERS FAILED -> dead-lettered as %s (returning 200 empty, SearXNG-compatible)", id)
 	env := map[string]any{
-		"query":                query,
-		"number_of_results":    0,
-		"results":              []any{},
-		"answers":              []any{},
-		"corrections":          []any{},
-		"infoboxes":            []any{},
-		"suggestions":          []any{},
-		"unresponsive_engines": []any{},
-		// router diagnostics (non-SearXNG keys; ignored by SearXNG parsers)
-		"router_status": "queued_for_retry",
-		"deadletter_id": id,
+		"query": query, "number_of_results": 0, "results": []any{},
+		"answers": []any{}, "corrections": []any{}, "infoboxes": []any{},
+		"suggestions": []any{}, "unresponsive_engines": []any{},
+		"router_status": "queued_for_retry", "deadletter_id": id,
 	}
+	status := http.StatusOK
 	if strict {
-		return http.StatusServiceUnavailable, mustJSON(env)
+		status = http.StatusServiceUnavailable
 	}
-	return http.StatusOK, mustJSON(env)
+	oc := searchOutcome{status: status, body: mustJSON(env), enginesUsed: enginesUsed,
+		tier: "none", unresponsive: last.unresponsive}
+	recordEvent(searchEvent{
+		TS: time.Now().UTC().Format(time.RFC3339Nano), Query: query, Tier: "none",
+		Engines: enginesUsed, Results: 0, Status: last.status, LatencyMS: last.latencyMS,
+		Unresponsive: last.unresponsive, Outcome: "deadletter",
+	})
+	return oc
+}
+
+// finishSearch records analytics for a successful upstream hit, injects additive
+// router metadata into the JSON body, and returns the outcome.
+func finishSearch(query, enginesUsed, tier string, tr tierResult, strict bool) searchOutcome {
+	// Inject additive router_* keys (SearXNG clients ignore unknown top-level keys).
+	body := tr.body
+	var doc map[string]json.RawMessage
+	if json.Unmarshal(body, &doc) == nil {
+		doc["router_engines_used"] = mustJSON(splitCSV(enginesUsed))
+		doc["router_tier"] = mustJSON(tier)
+		if b, err := json.Marshal(doc); err == nil {
+			body = b
+		}
+	}
+	recordEvent(searchEvent{
+		TS: time.Now().UTC().Format(time.RFC3339Nano), Query: query, Tier: tier,
+		Engines: enginesUsed, Results: tr.results, Status: tr.status, LatencyMS: tr.latencyMS,
+		Unresponsive: tr.unresponsive, Outcome: "ok",
+	})
+	return searchOutcome{status: http.StatusOK, body: body, enginesUsed: enginesUsed,
+		tier: tier, unresponsive: tr.unresponsive}
 }
 
 func mustJSON(v any) []byte {
@@ -569,8 +591,21 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 	strict := r.Header.Get("X-Router-Strict") == "1" || params.Get("strict") == "1"
 	params.Del("strict")
 	log.Printf("search q=%q categories=%q", params.Get("q"), params.Get("categories"))
-	status, body := handleSearch(params, strict)
-	writeJSON(w, status, body)
+	oc := handleSearch(params, strict)
+
+	// Router metadata as response headers (invisible to JSON parsers; safe).
+	if oc.enginesUsed != "" {
+		w.Header().Set("X-Router-Engines", oc.enginesUsed)
+	}
+	w.Header().Set("X-Router-Tier", oc.tier)
+	if len(oc.unresponsive) > 0 {
+		var names []string
+		for _, u := range oc.unresponsive {
+			names = append(names, u.Engine)
+		}
+		w.Header().Set("X-Router-Unresponsive", strings.Join(names, ","))
+	}
+	writeJSON(w, oc.status, oc.body)
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -621,6 +656,9 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/search", searchHandler)
 	mux.HandleFunc("/healthz", healthHandler)
+	mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, mustJSON(statsSnapshot()))
+	})
 
 	// Bind loopback (host-side tools) + docker bridge gateway (containers reach
 	// via host.docker.internal). Extra bind addrs can be set via ROUTER_BIND_ADDRS
