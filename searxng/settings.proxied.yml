@@ -39,15 +39,16 @@ ui:
     simple_style: dark
 
 engines:
-  # Multiple general engines so no single engine is a point of failure.
+  # All rotation engines enabled; router targets subsets via engines= per query.
+  # See settings.yml for the index-family rationale.
   - name: google
     engine: google
     shortcut: g
     disabled: false
 
-  - name: duckduckgo
-    engine: duckduckgo
-    shortcut: ddg
+  - name: startpage
+    engine: startpage
+    shortcut: sp
     disabled: false
 
   - name: bing
@@ -55,22 +56,49 @@ engines:
     shortcut: b
     disabled: false
 
-  - name: wikipedia
-    engine: wikipedia
-    shortcut: wp
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    disabled: false
 
-  - name: github
-    engine: github
-    shortcut: gh
+  - name: yahoo
+    engine: yahoo
+    shortcut: yh
+    disabled: false
 
   - name: brave
     engine: brave
     shortcut: br
-    disabled: true
+    disabled: false
+
+  - name: yandex
+    engine: yandex
+    shortcut: yx
+    disabled: false
+
+  - name: qwant
+    engine: qwant
+    shortcut: qw
+    disabled: false
 
   - name: mojeek
     engine: mojeek
     shortcut: mjk
+    disabled: false
+
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: wp
+    disabled: true
+
+  - name: wikidata
+    engine: wikidata
+    shortcut: wd
+    disabled: true
+
+  - name: github
+    engine: github
+    shortcut: gh
     disabled: true
 
 

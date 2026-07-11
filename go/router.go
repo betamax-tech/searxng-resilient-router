@@ -32,6 +32,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -186,6 +188,107 @@ func envOr(k, def string) string {
 	return def
 }
 
+// ------------------------------------------------------------------ engine rotation
+//
+// SearXNG has no built-in per-engine rate limiter or rotation, so the router
+// does it: each engine has its own token bucket (tolerance-based budget), and
+// each query is sent to a SUBSET of engines chosen so no single engine endpoint
+// gets hammered into suspension. Engines are grouped into INDEX FAMILIES —
+// members of a family serve the same underlying index, so we only need ONE
+// member per family per query, and we pick whichever member still has budget
+// (a "hot spare"): e.g. serve Google's index via startpage when google is spent.
+//
+// Budgets are per-minute, tunable via env ROUTER_ENGINE_RATE_<NAME> (e.g.
+// ROUTER_ENGINE_RATE_GOOGLE=5). Researched tolerance defaults below.
+
+type engineDef struct {
+	name       string
+	perMin     float64
+	bucket     *tokenBucket
+}
+
+// index families: pick ONE available member per family per query (order = preference)
+var engineFamilies = [][]string{
+	{"google", "startpage"},          // Google's index (startpage proxies Google)
+	{"bing", "duckduckgo", "yahoo"},  // Bing's index (ddg/yahoo re-serve Bing)
+	{"brave"},                        // independent
+}
+
+// independent pool: rotated, up to independentsPerQuery picked per query by most-tokens
+var independentPool = []string{"yandex", "qwant", "mojeek"}
+
+const independentsPerQuery = 1
+
+// tolerance-based default budgets (requests/min per engine from a datacenter IP)
+var engineRateDefaults = map[string]float64{
+	"google": 5, "startpage": 5, // aggressive → sip
+	"bing": 12, "duckduckgo": 12, "yahoo": 5,
+	"brave":  12,
+	"yandex": 8, "qwant": 4, "mojeek": 8,
+}
+
+var engines = func() map[string]*engineDef {
+	m := map[string]*engineDef{}
+	for name, def := range engineRateDefaults {
+		rate := def
+		if v := os.Getenv("ROUTER_ENGINE_RATE_" + strings.ToUpper(name)); v != "" {
+			if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+				rate = f
+			}
+		}
+		// burst = 1 minute's worth (min 3) so short bursts are absorbed.
+		burst := int(rate)
+		if burst < 3 {
+			burst = 3
+		}
+		m[name] = &engineDef{name: name, perMin: rate, bucket: newTokenBucket(burst, rate/60.0)}
+	}
+	return m
+}()
+
+// selectEngines picks the engine subset for this query, spending one token per
+// chosen engine. Returns the comma-separated engines= value (empty = let SearXNG
+// use its enabled defaults, i.e. all — a safe fallback when everything's spent).
+func selectEngines() string {
+	var chosen []string
+
+	// one available member per index family (hot-spare fallback within family)
+	for _, fam := range engineFamilies {
+		for _, name := range fam {
+			e := engines[name]
+			if e != nil && e.bucket.TryTake() {
+				chosen = append(chosen, name)
+				break // got this family's index; move on
+			}
+		}
+	}
+
+	// rotate independents: pick the ones with the most tokens, up to N
+	type it struct {
+		name string
+		tok  float64
+	}
+	var pool []it
+	for _, name := range independentPool {
+		if e := engines[name]; e != nil {
+			pool = append(pool, it{name, e.bucket.Available()})
+		}
+	}
+	sort.Slice(pool, func(i, j int) bool { return pool[i].tok > pool[j].tok })
+	added := 0
+	for _, p := range pool {
+		if added >= independentsPerQuery {
+			break
+		}
+		if engines[p.name].bucket.TryTake() {
+			chosen = append(chosen, p.name)
+			added++
+		}
+	}
+
+	return strings.Join(chosen, ",")
+}
+
 // tryAcquireDirect reserves a direct slot if: (1) not cooling down after a
 // rate-limit, (2) within the outbound rate budget (token bucket protecting our
 // real IP), and (3) under the concurrency limit. Any failure -> spill to proxied.
@@ -271,6 +374,21 @@ func tryTier(name, base string, params url.Values, timeout time.Duration) []byte
 
 func handleSearch(params url.Values, strict bool) (int, []byte) {
 	query := params.Get("q")
+
+	// Per-query engine rotation: unless the caller pinned specific engines,
+	// choose a per-index-family subset (spending per-engine budget) so no single
+	// engine endpoint gets hammered into suspension. Empty selection (all budgets
+	// spent) falls back to SearXNG's enabled defaults.
+	if params.Get("engines") == "" {
+		if sel := selectEngines(); sel != "" {
+			params.Set("engines", sel)
+			// engines= and categories= together can over-restrict; let engines win.
+			params.Del("categories")
+			log.Printf("  engines rotated -> %s", sel)
+		} else {
+			log.Printf("  engines: all budgets spent -> SearXNG defaults")
+		}
+	}
 
 	// Direct-only mode: pin to the direct instance, never spill to the proxied
 	// (rotating-IP) tier. Use when the caller must keep a session on ONE
@@ -449,6 +567,15 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		"proxied_rate_per_min":   int(proxiedBucket.refillRate * 60),
 		"max_wait_seconds":       int(maxWait.Seconds()),
 	}
+	// per-engine bucket state (rotation visibility)
+	eng := map[string]any{}
+	for name, e := range engines {
+		eng[name] = map[string]any{
+			"tokens":  int(e.bucket.Available()),
+			"per_min": e.perMin,
+		}
+	}
+	state["engines"] = eng
 	b, _ := json.Marshal(state)
 	writeJSON(w, http.StatusOK, b)
 }

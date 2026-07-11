@@ -42,45 +42,78 @@ ui:
     simple_style: dark
 
 engines:
-  # Multiple general engines enabled so no single engine is a point of failure.
-  # When one gets rate-limited/suspended (e.g. Google after a burst), the others
-  # keep results flowing. Engine reliability drifts over time — re-test with
-  # `&engines=<name>` if one starts failing and flip disabled accordingly.
+  # ALL rotation engines are enabled here so the front-door ROUTER can target
+  # any subset per-query via the `engines=` API param. The router owns the
+  # rotation policy (per-engine token buckets + index-family hot-spares), NOT
+  # SearXNG's defaults — it sends google-quality via startpage when google is
+  # spent, bing-quality via duckduckgo/yahoo when bing is spent, etc. so no
+  # single engine endpoint gets suspended.
+  #
+  # Index families (router groups these):
+  #   google-family : google, startpage   (startpage proxies Google's index)
+  #   bing-family   : bing, duckduckgo, yahoo   (all serve Bing's index)
+  #   brave         : brave                (independent)
+  #   independents  : yandex, qwant, mojeek     (own indexes, rotated)
   - name: google
     engine: google
     shortcut: g
     disabled: false
 
-  # DuckDuckGo: reliable from this host again; returns highly relevant results.
-  - name: duckduckgo
-    engine: duckduckgo
-    shortcut: ddg
+  - name: startpage
+    engine: startpage
+    shortcut: sp
     disabled: false
 
-  # Bing: reliable fallback; broad coverage.
   - name: bing
     engine: bing
     shortcut: b
     disabled: false
 
-  - name: wikipedia
-    engine: wikipedia
-    shortcut: wp
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    disabled: false
 
-  - name: github
-    engine: github
-    shortcut: gh
+  - name: yahoo
+    engine: yahoo
+    shortcut: yh
+    disabled: false
 
-  # --- Disabled: currently CAPTCHA / access-deny this host's datacenter IP. ---
-  # Reachable via !bang if ever needed; re-enable if they recover.
   - name: brave
     engine: brave
     shortcut: br
-    disabled: true
+    disabled: false
+
+  - name: yandex
+    engine: yandex
+    shortcut: yx
+    disabled: false
+
+  - name: qwant
+    engine: qwant
+    shortcut: qw
+    disabled: false
 
   - name: mojeek
     engine: mojeek
     shortcut: mjk
+    disabled: false
+
+  # Encyclopedic/structured — NOT general web. Disabled for web search because
+  # they inject low-yield/off-topic "trash" results (Wikidata entities, etc.).
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: wp
+    disabled: true
+
+  - name: wikidata
+    engine: wikidata
+    shortcut: wd
+    disabled: true
+
+  - name: github
+    engine: github
+    shortcut: gh
     disabled: true
 
 outgoing:
