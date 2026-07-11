@@ -246,6 +246,19 @@ var engines = func() map[string]*engineDef {
 	return m
 }()
 
+// hasBang reports whether the query contains a SearXNG engine/category bang
+// (a token beginning with '!' , e.g. "!google", "!!wikipedia", "!general").
+// When present, the caller has explicitly chosen where to search, so the router
+// must not inject its own engines= (which would fight SearXNG's bang parsing).
+func hasBang(q string) bool {
+	for _, tok := range strings.Fields(q) {
+		if strings.HasPrefix(tok, "!") {
+			return true
+		}
+	}
+	return false
+}
+
 // selectEngines picks the engine subset for this query, spending one token per
 // chosen engine. Returns the comma-separated engines= value (empty = let SearXNG
 // use its enabled defaults, i.e. all — a safe fallback when everything's spent).
@@ -375,11 +388,17 @@ func tryTier(name, base string, params url.Values, timeout time.Duration) []byte
 func handleSearch(params url.Values, strict bool) (int, []byte) {
 	query := params.Get("q")
 
-	// Per-query engine rotation: unless the caller pinned specific engines,
+	// Per-query engine rotation: unless the caller has ALREADY chosen engines,
 	// choose a per-index-family subset (spending per-engine budget) so no single
 	// engine endpoint gets hammered into suspension. Empty selection (all budgets
 	// spent) falls back to SearXNG's enabled defaults.
-	if params.Get("engines") == "" {
+	//
+	// The caller's explicit choice ALWAYS wins and disables rotation, via either:
+	//   - an `engines=` (or `engine=`) query param, OR
+	//   - a SearXNG !bang / :bang in the query text (e.g. "!google ...", "!ddg ..."),
+	//     which SearXNG parses itself — we must not fight it with an engines= inject.
+	callerChoseEngines := params.Get("engines") != "" || params.Get("engine") != "" || hasBang(query)
+	if !callerChoseEngines {
 		if sel := selectEngines(); sel != "" {
 			params.Set("engines", sel)
 			// engines= and categories= together can over-restrict; let engines win.
@@ -388,6 +407,8 @@ func handleSearch(params url.Values, strict bool) (int, []byte) {
 		} else {
 			log.Printf("  engines: all budgets spent -> SearXNG defaults")
 		}
+	} else {
+		log.Printf("  engines: caller-specified (bang/param) -> rotation skipped")
 	}
 
 	// Direct-only mode: pin to the direct instance, never spill to the proxied
