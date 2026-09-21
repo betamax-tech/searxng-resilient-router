@@ -12,6 +12,7 @@ RestartSec=3
 # Resource guards (host is RAM-tight)
 MemoryMax=64M
 Environment=DEADLETTER_DIR=/home/cmark/server/searxng-rotation/cache/deadletter
+Environment=ROUTER_BIND_ADDRS=127.0.0.1:8899,172.17.0.1:8899,100.90.81.5:8899
 
 [Install]
 WantedBy=default.target
