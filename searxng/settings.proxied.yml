@@ -14,7 +14,7 @@ general:
   debug: false
 
 search:
-  safe_search: 0
+  safe_search: 2                      # floor only helps safesearch-capable engines; hostnames plugin below is the real fix for engines (e.g. yandex) that don't implement safesearch at all
   autocomplete: "google"
   default_lang: "en"
   # Retry across engines within a single search before giving up — improves
@@ -46,6 +46,42 @@ ui:
   default_theme: simple
   theme_args:
     simple_style: dark
+
+# Engine-agnostic junk filter, applied to every result after every engine
+# returns (so it still works even when an engine doesn't implement safesearch,
+# e.g. yandex — see root cause #1 in the investigation doc). `remove` entries
+# are the actual junk observed hitting live legal/technical queries on
+# 2026-10-12; `high_priority` boosts the PH legal primary sources named in the
+# task so they sort above generic noise even on a relevance tie.
+hostnames:
+  remove:
+    - '(.*\.)?pornhub\.com$'
+    - '(.*\.)?xvideos\.com$'
+    - '(.*\.)?xnxx\.com$'
+    - '(.*\.)?xhamster\.com$'
+    - '(.*\.)?redtube\.com$'
+    - '(.*\.)?youporn\.com$'
+    - '(.*\.)?onlyfans\.com$'
+    - '(.*\.)?chaturbate\.com$'
+    - '(.*\.)?stripchat\.com$'
+    - '(.*\.)?[a-z0-9-]*porn[a-z0-9-]*\..*'
+    - '(.*\.)?friv\.com$'
+    - '(.*\.)?[a-z0-9-]*gamesforgirls[a-z0-9-]*\..*'
+    - '(.*\.)?framesynthesis\.com$'      # observed junk hit (3D driving/parking simulators), 2026-10-12
+    - '(.*\.)?ra\.co$'                   # observed junk hit (Resident Advisor music site) for query "RA 4726", 2026-10-12
+  low_priority:
+    - '(.*\.)?pinterest\.com$'
+    - '(.*\.)?tiktok\.com$'
+    - '(.*\.)?youtube\.com$'
+    - '(.*\.)?dictionary\.com$'
+    - '(.*\.)?wiktionary\.org$'
+  high_priority:
+    - '(.*\.)?lawphil\.net$'
+    - '(.*\.)?chanrobles\.com$'
+    - '(.*\.)?elibrary\.judiciary\.gov\.ph$'
+    - '(.*\.)?sc\.judiciary\.gov\.ph$'
+    - '(.*\.)?officialgazette\.gov\.ph$'
+    - '(.*\.)?gov(\.[a-z]{2})?$'
 
 engines:
   # All rotation engines enabled; router targets subsets via engines= per query.
