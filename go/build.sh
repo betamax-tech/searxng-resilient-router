@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build all three static Go binaries. Requires Go (see README for install).
+# Build the static Go binaries. Requires Go (see README for install).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -9,13 +9,12 @@ export GOCACHE="${GOCACHE:-${HOME}/.cache/go-build}"
 export CGO_ENABLED=0
 
 echo "Building searxng-router…"
-go build -ldflags="-s -w" -o searxng-router router.go
+# NOTE: the router is split across router.go + analytics.go (both package main,
+# only router.go has main()). Both MUST be compiled together.
+go build -ldflags="-s -w" -o searxng-router router.go analytics.go
 
 echo "Building proxypool…"
 go build -ldflags="-s -w" -o proxypool proxypool.go
 
-echo "Building deadletter-retry…"
-go build -ldflags="-s -w" -o deadletter-retry deadletter_retry.go
-
 echo "Done:"
-ls -lh searxng-router proxypool deadletter-retry
+ls -lh searxng-router proxypool

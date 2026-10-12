@@ -1,11 +1,53 @@
 # searxng-resilient-router
 
 A resilient self-hosted [SearXNG](https://github.com/searxng/searxng) search
-stack with automatic **proxy rotation**, **rate limiting**, **tiered failover**,
-and **query preservation** — built so automated research tools (e.g. an
-`local-researcher` MCP) never get the dreaded *"No search results found"* again.
+stack with automatic **proxy rotation**, **rate limiting**, and **in-request
+tiered failover** — built so automated tools (e.g. OpenWebUI, a `local-researcher`
+MCP) get good multi-engine results instead of the datacenter-IP failure modes.
 
-## Why this exists
+---
+
+## ⚠️ ORIENTATION FOR ANYONE (agent or human) WORKING ON THIS — read first
+
+**Who calls this / topology.** The single stable endpoint is the Go router on
+`127.0.0.1:8899` (systemd *user* unit `searxng-router`). Behind it:
+`:8890` = **direct** SearXNG (our real IP), `:8891` = **proxied** SearXNG (rotating
+free proxies). Known consumers:
+- **OpenWebUI** (`openwebui` container) — Admin ▸ Settings ▸ Web Search ▸ SearXNG
+  Query URL = `http://host.docker.internal:8899/search?q=<query>`. This is why
+  OWUI search quality == router quality.
+- **`searxng.betamaxgroup.tech`** (Caddy) proxies to **`:8890` directly — it
+  BYPASSES the router**. So "works in the browser but bad in OWUI" = a router bug,
+  not a SearXNG bug. Compare `:8899` vs `:8890` with `&format=json` to see it.
+
+**The #1 gotcha — engine names must match THIS instance.** The router restricts
+each query to a rotating engine subset via `engines=`. Those names (in
+`go/router.go` → `engineFamilies` / `independentPool`) MUST be engines that are
+enabled AND actually return results from our datacenter IP. Measured 2026-07-22
+on `:8890` (isolated per-engine): **working** = `google cse` (20, API-key, the
+best), `google` (39 but flaky/CAPTCHA), `duckduckgo` (10), `bing` (10), `yandex`
+(10); **dead (return 0 here)** = `startpage`, `brave`, `qwant`, `mojeek`, `yahoo`.
+A stale list (asking for `google` scraper + the dead five, never `google cse`/`ddg`)
+silently collapses every search to **bing-only ~10 junk results**. If quality
+regresses, re-measure and update those lists. `google cse` has a ~100/**day** free
+API cap the router can't count — it's the family primary with `google` as spare.
+
+**No dead-letter / async retry (removed 2026-07-22).** The old design persisted
+failed queries to disk and a timer re-ran them — but a background retry reaches
+**no live caller**, and it fed a runaway loop that grew to **147k files / 585 MB**
+and starved the live engine budgets. Replaced with a **bounded in-request retry
+ladder** in `handleSearch` (direct-rotated → direct-all-engines → proxied-all,
+looped until `maxWait`≈20s, then return empty). "Keep retrying for the user"
+belongs at the caller's layer (OWUI), not here. The `searxng-deadletter.*` units,
+`deadletter_retry.go`, and `cache/deadletter/` are gone — do not resurrect them.
+
+**Build.** `go/router.go` + `go/analytics.go` are one program (both `package main`,
+only router.go has `main()`) → build them TOGETHER. `bash go/build.sh` does this;
+then `systemctl --user restart searxng-router`.
+
+---
+
+## Why this exists (original design notes)
 
 A plain self-hosted SearXNG on a datacenter IP breaks in three ways:
 

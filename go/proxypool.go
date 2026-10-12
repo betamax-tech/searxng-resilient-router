@@ -236,6 +236,18 @@ func saveJSON(path string, v any) {
 }
 
 func main() {
+	// --verify-only: cheap liveness pass — re-check the active pool ONLY and
+	// persist survivors (no source fetch, no refill). Run this frequently (e.g.
+	// every 5 min) so dead proxies are dropped fast and active_pool.json stays
+	// fresh (count + timestamp), which keeps the router's per-IP budget honest.
+	// The full run (fetch + refill to target) is the default (run every ~15 min).
+	verifyOnly := false
+	for _, a := range os.Args[1:] {
+		if a == "--verify-only" || a == "-verify-only" {
+			verifyOnly = true
+		}
+	}
+
 	stamp := time.Now().UTC().Format(time.RFC3339)
 
 	// 1. Re-verify active pool only.
@@ -248,8 +260,10 @@ func main() {
 	pool := checkMany(activeURLs)
 	logf("  survived: %d/%d", len(pool), len(activeURLs))
 
-	// 2. Refill from backlog if below target.
-	if len(pool) < target {
+	// 2. Refill from backlog if below target (skipped in --verify-only).
+	if verifyOnly {
+		logf("  verify-only: skipping refill (persisting %d survivors).", len(pool))
+	} else if len(pool) < target {
 		cands := loadCandidates()
 		if len(cands) == 0 {
 			logf("Candidate backlog empty — fetching public source lists…")

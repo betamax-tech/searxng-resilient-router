@@ -31,7 +31,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -62,12 +61,11 @@ const (
 
 	// When both buckets are dry, a request waits up to this long for a token
 	// before giving up and dead-lettering (bounded latency, never blocks forever).
-	maxWait = 8 * time.Second
+	maxWait = 20 * time.Second // in-request retry ceiling: hold a failing search this long, escalating, before returning empty
 
 	activePoolFile = "/home/cmark/server/searxng-rotation/cache/active_pool.json"
 )
 
-var deadletterDir = envOr("DEADLETTER_DIR", "/home/cmark/server/searxng-rotation/cache/deadletter")
 
 // defaultDirectOnly pins ALL searches to the direct tier (no proxy spillover)
 // when ROUTER_DIRECT_ONLY is truthy. Per-request ?direct= overrides this.
@@ -207,24 +205,45 @@ type engineDef struct {
 	bucket     *tokenBucket
 }
 
-// index families: pick ONE available member per family per query (order = preference)
+// index families: pick ONE available member per family per query (order = preference).
+//
+// IMPORTANT: these names must match engines that are ENABLED and actually RETURN
+// results on THIS SearXNG instance from our datacenter IP. Measured 2026-07-22
+// against the direct instance (:8890), isolated per-engine queries:
+//
+//     google cse  -> 20  (Google's JSON *API* — reliable, but ~100 queries/DAY cap)
+//     google      -> 39  (scraper — high yield but FLAKY: frequently CAPTCHA'd to 0)
+//     duckduckgo  -> 10  (works)
+//     bing        -> 10  (works, most tolerant)
+//     yandex      -> 10  (works)
+//     startpage / brave / qwant / mojeek / yahoo -> 0  (blocked or not usable here)
+//
+// The previous list asked for `google` (flaky scraper, not the API) and the five
+// dead engines, and never asked for `google cse` or `duckduckgo` — so a rotated
+// query kept collapsing to bing-only (~10 junk results). Families below use the
+// engines that work; `google cse` is preferred for Google's index with the
+// `google` scraper as a hot-spare, and bing/duckduckgo rotate for Bing's index.
+// To retune budgets without a rebuild, set ROUTER_ENGINE_RATE_<NAME> (uppercased;
+// note "google cse" has a space and so cannot be overridden via env — edit here).
 var engineFamilies = [][]string{
-	{"google", "startpage"},          // Google's index (startpage proxies Google)
-	{"bing", "duckduckgo", "yahoo"},  // Bing's index (ddg/yahoo re-serve Bing)
-	{"brave"},                        // independent
+	{"google cse", "google"},  // Google's index — cse (API, reliable) preferred; google scraper as spare
+	{"bing", "duckduckgo"},     // Bing's index (ddg re-serves Bing) — rotate to avoid hammering one
 }
 
 // independent pool: rotated, up to independentsPerQuery picked per query by most-tokens
-var independentPool = []string{"yandex", "qwant", "mojeek"}
+var independentPool = []string{"yandex"}
 
 const independentsPerQuery = 1
 
-// tolerance-based default budgets (requests/min per engine from a datacenter IP)
+// tolerance-based default budgets (requests/min per engine from a datacenter IP).
+// "google cse" is API-key based (no per-request block, but a hard ~100/DAY free
+// quota the router can't count) so keep it modest; when its per-min budget is
+// spent the family falls back to the `google` scraper, conserving the daily cap.
 var engineRateDefaults = map[string]float64{
-	"google": 5, "startpage": 5, // aggressive → sip
-	"bing": 12, "duckduckgo": 12, "yahoo": 5,
-	"brave":  12,
-	"yandex": 8, "qwant": 4, "mojeek": 8,
+	"google cse": 5,
+	"google":     6,
+	"bing":       12, "duckduckgo": 12,
+	"yandex": 8,
 }
 
 var engines = func() map[string]*engineDef {
@@ -441,62 +460,68 @@ func handleSearch(params url.Values, strict bool) searchOutcome {
 		params.Del("direct")
 	}
 
-	var last tierResult
+	// Bounded, IN-REQUEST retry ladder. We hold the request open and keep trying,
+	// escalating coverage, until something non-empty comes back or maxWait elapses;
+	// then we return best-effort. There is NO disk dead-letter / async retry: a
+	// recovered result only helps the caller that is STILL WAITING right now, and
+	// a background retry into a drawer nobody reads just bred an unbounded backlog.
+	// If a caller wants "keep trying," that belongs at their layer (e.g. OWUI).
+	//
+	//   1) DIRECT, rotated engine subset  (fast path — spares engines)
+	//   2) DIRECT, ALL enabled engines    (max coverage — strongest recovery)
+	//   3) PROXIED, ALL enabled engines   (rotating IPs — real direct-IP blocks; skipped in direct-only)
+	//
+	// Steps 2–3 repeat until the deadline so a transient blip self-heals here.
+	rotated := cloneValues(params) // engines= from selection (may be "")
+	allEng := cloneValues(params)
+	allEng.Del("engines") // force SearXNG's full enabled set
 
-	if directOnly {
-		last = tryTier("direct", direct, params, directTimeout)
-		if last.body != nil {
-			return finishSearch(query, enginesUsed, "direct", last, strict)
-		}
-		log.Printf("  direct-only: direct tier failed -> dead-letter (no proxy spill)")
-	} else {
-		// Per-IP throttle: prefer direct (own 6/min IP budget), else proxied pool
-		// (N×6/min across N proxy IPs). If both dry, wait up to maxWait to smooth
-		// bursts, then dead-letter (bounded latency).
-		deadline := time.Now().Add(maxWait)
-		waited := false
-		attempted := false
-		for !attempted {
+	var last tierResult
+	deadline := time.Now().Add(maxWait)
+	firstPass := true
+	for {
+		// 1) direct, rotated subset — worth trying once (its engines don't change mid-request)
+		if firstPass {
+			firstPass = false
 			if ok, _ := tryAcquireDirect(); ok {
-				attempted = true
-				last = tryTier("direct", direct, params, directTimeout)
+				last = tryTier("direct", direct, rotated, directTimeout)
 				releaseDirect()
 				if last.body != nil {
 					return finishSearch(query, enginesUsed, "direct", last, strict)
 				}
 			}
-			if proxiedBucket.TryTake() {
-				attempted = true
-				last = tryTier("proxied", proxied, params, proxiedTimeout)
-				if last.body != nil {
-					return finishSearch(query, enginesUsed, "proxied", last, strict)
-				}
-			}
-			if attempted {
-				break
-			}
-			if time.Now().After(deadline) {
-				log.Printf("  throttle: no IP budget within %s -> dead-letter", maxWait)
-				break
-			}
-			if !waited {
-				log.Printf("  throttle: all IP budgets dry, waiting up to %s…", maxWait)
-				waited = true
-			}
-			time.Sleep(250 * time.Millisecond)
 		}
+		// 2) direct, all engines
+		if ok, _ := tryAcquireDirect(); ok {
+			last = tryTier("direct", direct, allEng, directTimeout)
+			releaseDirect()
+			if last.body != nil {
+				return finishSearch(query, "", "direct", last, strict)
+			}
+		}
+		// 3) proxied, all engines (unless pinned to direct-only)
+		if !directOnly && proxiedBucket.TryTake() {
+			last = tryTier("proxied", proxied, allEng, proxiedTimeout)
+			if last.body != nil {
+				return finishSearch(query, "", "proxied", last, strict)
+			}
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(400 * time.Millisecond)
 	}
 
-	// Dead-letter — respond AS SEARXNG (HTTP 200 + empty results) so clients that
-	// call raise_for_status() don't break; query persisted for retry. Opt-in
-	// X-Router-Strict / ?strict=1 restores the 503 signal.
-	id := deadLetter(query)
-	log.Printf("  ALL TIERS FAILED -> dead-lettered as %s (returning 200 empty, SearXNG-compatible)", id)
+	// Exhausted within maxWait — respond AS SEARXNG (HTTP 200 + empty results) so
+	// clients that call raise_for_status() don't break. Opt-in X-Router-Strict /
+	// ?strict=1 returns 503 instead. Nothing is persisted: the only consumer is the
+	// caller waiting on THIS request, which has now given up.
+	log.Printf("  ALL TIERS EXHAUSTED within %s -> returning empty (no dead-letter)", maxWait)
 	env := map[string]any{
 		"query": query, "number_of_results": 0, "results": []any{},
 		"answers": []any{}, "corrections": []any{}, "infoboxes": []any{},
 		"suggestions": []any{}, "unresponsive_engines": []any{},
-		"router_status": "queued_for_retry", "deadletter_id": id,
+		"router_status": "exhausted",
 	}
 	status := http.StatusOK
 	if strict {
@@ -507,7 +532,7 @@ func handleSearch(params url.Values, strict bool) searchOutcome {
 	recordEvent(searchEvent{
 		TS: time.Now().UTC().Format(time.RFC3339Nano), Query: query, Tier: "none",
 		Engines: enginesUsed, Results: 0, Status: last.status, LatencyMS: last.latencyMS,
-		Unresponsive: last.unresponsive, Outcome: "deadletter",
+		Unresponsive: last.unresponsive, Outcome: "exhausted",
 	})
 	return oc
 }
@@ -537,24 +562,6 @@ func finishSearch(query, enginesUsed, tier string, tr tierResult, strict bool) s
 func mustJSON(v any) []byte {
 	b, _ := json.Marshal(v)
 	return b
-}
-
-var dlMu sync.Mutex
-
-func deadLetter(query string) string {
-	dlMu.Lock()
-	defer dlMu.Unlock()
-	_ = os.MkdirAll(deadletterDir, 0o755)
-	name := time.Now().UTC().Format("20060102T150405.000000000") + ".json"
-	fp := filepath.Join(deadletterDir, name)
-	rec := map[string]any{
-		"query":     query,
-		"queued_at": time.Now().UTC().Format(time.RFC3339Nano),
-		"attempts":  0,
-	}
-	b, _ := json.MarshalIndent(rec, "", "  ")
-	_ = os.WriteFile(fp, b, 0o644)
-	return name
 }
 
 // ------------------------------------------------------------------ http
