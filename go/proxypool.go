@@ -339,6 +339,18 @@ func writeSettings(proxies []string, stamp string) {
 		os.Exit(1)
 	}
 	text := string(raw)
+	// Guard: refuse to write back a file that has already lost its core config
+	// — this is exactly the 2026-10-12 regression (settings.proxied.yml reduced
+	// to only the managed proxy block, missing use_default_settings/engines/
+	// search, which crashes every request with KeyError: default_doi_resolver).
+	// This converts a silent, self-perpetuating 500-on-every-request outage into
+	// a loud, one-time ExecStartPost failure visible in
+	// `systemctl --user status searxng-proxypool.service`.
+	if !settingsHasCoreSections(text) {
+		logf("REFUSING to update %s: missing use_default_settings/engines: "+
+			"(file may be corrupted). Not touching it — fix the file manually first.", settingsPath)
+		os.Exit(3)
+	}
 	var b strings.Builder
 	b.WriteString(beginMarker + "\n")
 	desc := "direct connection"

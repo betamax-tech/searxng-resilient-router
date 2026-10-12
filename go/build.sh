@@ -14,7 +14,9 @@ echo "Building searxng-router…"
 go build -ldflags="-s -w" -o searxng-router router.go analytics.go
 
 echo "Building proxypool…"
-go build -ldflags="-s -w" -o proxypool proxypool.go
+# settingsguard.go is required: proxypool.go's writeSettings() calls
+# settingsHasCoreSections() from it (shared with the router build/tests).
+go build -ldflags="-s -w" -o proxypool proxypool.go settingsguard.go
 
 echo "Done:"
 ls -lh searxng-router proxypool
