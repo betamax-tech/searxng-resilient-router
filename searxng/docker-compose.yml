@@ -1,7 +1,13 @@
 services:
   # Primary — DIRECT connection (fast path, preferred by the router).
   searxng:
-    image: searxng/searxng:latest
+    # Pinned 2026-10-13 (P5) to the digest already running (2026.7.9-8456831a0)
+    # — `latest` meant the next `docker compose pull` could silently change
+    # engine behavior again, which is exactly how the engineFamilies/
+    # engineRateDefaults lists above go stale (per README's 2026-07-22 note).
+    # Upgrade deliberately: re-run the engine-health matrix in the
+    # investigation doc after any bump, before relying on it.
+    image: searxng/searxng@sha256:a7b2b16eb4d79c2f0f6cff84fab9c41137e4e6dd29a1f64e2d785d27acb5a2e0
     container_name: searxng
     restart: unless-stopped
     ports:
@@ -22,7 +28,8 @@ services:
   # (settings.proxied.yml managed block). Used by the router as tier-2 spillover
   # when the direct instance is saturated or rate-limited.
   searxng-proxied:
-    image: searxng/searxng:latest
+    # Pinned 2026-10-13 (P5) — see the `searxng` service comment above.
+    image: searxng/searxng@sha256:a7b2b16eb4d79c2f0f6cff84fab9c41137e4e6dd29a1f64e2d785d27acb5a2e0
     container_name: searxng-proxied
     restart: unless-stopped
     ports:
