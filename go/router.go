@@ -289,6 +289,37 @@ func hasBang(q string) bool {
 	return false
 }
 
+// hasSiteFilter reports whether the query contains a `site:` boolean filter
+// (case-insensitive — SearXNG/Bing/Google all accept "Site:" too). P3: Yandex
+// and the DuckDuckGo-HTML scraper in SearXNG are unreliable with Google/Bing-
+// style `site:` syntax (extended_research's legal "(site:lawphil.net OR ...)"
+// queries need Bing/Google-cse specifically). Treated the same as an explicit
+// caller engine choice: rotation is skipped and the query falls through to
+// SearXNG's full enabled engine set, which includes the site:-honoring engines,
+// rather than being pinned to whatever the rotated 2-3 engine subset happens
+// to contain this request.
+func hasSiteFilter(q string) bool {
+	return strings.Contains(strings.ToLower(q), "site:")
+}
+
+// decideRotation reports whether per-query engine rotation should apply, given
+// whether the caller already chose engines (explicit engines=/engine= param,
+// a SearXNG bang, or a site: filter — see hasSiteFilter) and the caller's
+// `categories` param. Pure/testable; handleSearch() is the only caller.
+//
+// P2 (2026-10-13): a caller-specified NON-general category (science/it/news/...)
+// already has its own curated, SearXNG-enabled engine set (arxiv/pubmed/
+// stackoverflow/bing news/...). Rotating + deleting that category on every
+// request silently discarded every consumer's category routing (OWUI
+// extended_research legal/academic/it/news, local-researcher's categories
+// param) — the categories param never actually reached SearXNG. Rotation now
+// only applies to the general/unset case, which is where engine-suspension
+// protection actually matters (the generic-web giants are what gets CAPTCHA'd).
+func decideRotation(callerChoseEngines bool, categories string) bool {
+	isGeneralOrUnset := categories == "" || categories == "general"
+	return !callerChoseEngines && isGeneralOrUnset
+}
+
 // selectEngines picks the engine subset for this query, spending one token per
 // chosen engine. Returns the comma-separated engines= value (empty = let SearXNG
 // use its enabled defaults, i.e. all — a safe fallback when everything's spent).
@@ -446,21 +477,31 @@ func handleSearch(params url.Values, strict bool) searchOutcome {
 	// engine endpoint gets hammered into suspension. Empty selection (all budgets
 	// spent) falls back to SearXNG's enabled defaults.
 	//
-	// The caller's explicit choice ALWAYS wins and disables rotation, via either:
+	// The caller's explicit choice ALWAYS wins and disables rotation, via:
 	//   - an `engines=` (or `engine=`) query param, OR
 	//   - a SearXNG !bang / :bang in the query text (e.g. "!google ...", "!ddg ..."),
-	//     which SearXNG parses itself — we must not fight it with an engines= inject.
-	callerChoseEngines := params.Get("engines") != "" || params.Get("engine") != "" || hasBang(query)
-	if !callerChoseEngines {
+	//     which SearXNG parses itself — we must not fight it with an engines= inject, OR
+	//   - a `site:` filter in the query text (P3) — Yandex and the DuckDuckGo
+	//     scraper don't reliably honor site:, so fall through to SearXNG's full
+	//     enabled set (which includes Bing/google cse) instead of the rotated subset.
+	cat := params.Get("categories")
+	callerChoseEngines := params.Get("engines") != "" || params.Get("engine") != "" ||
+		hasBang(query) || hasSiteFilter(query)
+	if decideRotation(callerChoseEngines, cat) {
 		if sel := selectEngines(); sel != "" {
 			params.Set("engines", sel)
-			params.Del("categories") // let engines win over categories
+			// P2: do NOT params.Del("categories") here. Deleting it was the bug —
+			// the caller's categories param (science/it/news/legal routing) never
+			// reached SearXNG because rotation always wins for general/unset
+			// categories anyway (decideRotation only rotates when categories is
+			// "" or "general"), so leaving it set is harmless for THIS branch and
+			// keeps the param alive for any downstream tier retry.
 			log.Printf("  engines rotated -> %s", sel)
 		} else {
 			log.Printf("  engines: all budgets spent -> SearXNG defaults")
 		}
 	} else {
-		log.Printf("  engines: caller-specified (bang/param) -> rotation skipped")
+		log.Printf("  engines: caller-specified (bang/param/site:/category=%s) -> rotation skipped", cat)
 	}
 	enginesUsed := params.Get("engines")
 
