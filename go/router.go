@@ -225,9 +225,18 @@ type engineDef struct {
 // `google` scraper as a hot-spare, and bing/duckduckgo rotate for Bing's index.
 // To retune budgets without a rebuild, set ROUTER_ENGINE_RATE_<NAME> (uppercased;
 // note "google cse" has a space and so cannot be overridden via env — edit here).
+//
+// P4 (2026-10-13): the "google" scraper hot-spare below was DEAD WEIGHT — it is
+// not in `/config`'s enabled engine list on :8890 despite `disabled: false` in
+// settings.yml, so when `google cse`'s ~100/day quota trips (it does, every
+// day), the family silently contributed nothing. Swapped for `startpage`, which
+// actually proxies Google's index and IS enabled; it gets CAPTCHA'd sometimes
+// too, but self-heals within ~2min via ban_time_on_fail, unlike `google` which
+// structurally never works on this instance. Re-measure per README's own
+// 2026-07-22-style note if quality regresses again.
 var engineFamilies = [][]string{
-	{"google cse", "google"},  // Google's index — cse (API, reliable) preferred; google scraper as spare
-	{"bing", "duckduckgo"},     // Bing's index (ddg re-serves Bing) — rotate to avoid hammering one
+	{"google cse", "startpage"}, // Google's index — cse (API, reliable) preferred; startpage proxies Google when cse is spent
+	{"bing", "duckduckgo"},      // Bing's index (ddg re-serves Bing) — rotate to avoid hammering one
 }
 
 // independent pool: rotated, up to independentsPerQuery picked per query by most-tokens
@@ -238,10 +247,12 @@ const independentsPerQuery = 1
 // tolerance-based default budgets (requests/min per engine from a datacenter IP).
 // "google cse" is API-key based (no per-request block, but a hard ~100/DAY free
 // quota the router can't count) so keep it modest; when its per-min budget is
-// spent the family falls back to the `google` scraper, conserving the daily cap.
+// spent the family falls back to `startpage`, conserving the daily cap. "google"
+// has no budget entry (P4): it's not enabled on this instance, so a budget for
+// it would be dead weight — see engineFamilies comment above.
 var engineRateDefaults = map[string]float64{
 	"google cse": 5,
-	"google":     6,
+	"startpage":  6,
 	"bing":       12, "duckduckgo": 12,
 	"yandex": 8,
 }
