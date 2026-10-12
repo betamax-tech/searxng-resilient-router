@@ -1,0 +1,7 @@
+[Unit]
+Description=Junk-detection health canary for searxng-resilient-router
+After=searxng-router.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/cmark/server/searxng-rotation/searxng-health-canary.sh

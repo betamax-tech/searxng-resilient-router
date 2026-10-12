@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the SearXNG junk-detection canary every 15 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
