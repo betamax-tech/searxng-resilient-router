@@ -9,9 +9,23 @@ export GOCACHE="${GOCACHE:-${HOME}/.cache/go-build}"
 export CGO_ENABLED=0
 
 echo "Building searxng-router…"
-# NOTE: the router is split across router.go + analytics.go (both package main,
-# only router.go has main()). Both MUST be compiled together.
-go build -ldflags="-s -w" -o searxng-router router.go analytics.go
+# NOTE: the router is split across multiple package-main files (only
+# router.go has main()). ALL must be compiled together:
+#   router.go           - front-door HTTP handlers, SearXNG direct/proxied tiers
+#   analytics.go        - event log + /stats
+#   providers.go        - Provider interface + registry
+#   provider_exa.go      \
+#   provider_tavily.go    } paid provider adapters
+#   provider_brave.go     }
+#   provider_tinyfish.go /
+#   caps.go             - per-provider spend/usage cap limiter (disk-persisted)
+#   tiers.go            - tier=crucial|standard|bulk classification + shadow hook
+#   searchcache.go      - 24h disk cache for the tiered router
+#   tiered_router.go     - the provider/tier waterfall itself
+go build -ldflags="-s -w" -o searxng-router \
+	router.go analytics.go \
+	providers.go provider_exa.go provider_tavily.go provider_brave.go provider_tinyfish.go \
+	caps.go tiers.go searchcache.go tiered_router.go
 
 echo "Building proxypool…"
 # settingsguard.go is required: proxypool.go's writeSettings() calls

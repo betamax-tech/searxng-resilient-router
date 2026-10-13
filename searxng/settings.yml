@@ -81,59 +81,77 @@ engines:
   # ALL rotation engines are enabled here so the front-door ROUTER can target
   # any subset per-query via the `engines=` API param. The router owns the
   # rotation policy (per-engine token buckets + index-family hot-spares), NOT
-  # SearXNG's defaults — it sends google-quality via startpage when google is
-  # spent, bing-quality via duckduckgo/yahoo when bing is spent, etc. so no
-  # single engine endpoint gets suspended.
+  # SearXNG's defaults.
   #
-  # Index families (router groups these):
-  #   google-family : google, startpage   (startpage proxies Google's index)
-  #   bing-family   : bing, duckduckgo, yahoo   (all serve Bing's index)
-  #   brave         : brave                (independent)
-  #   independents  : yandex, qwant, mojeek     (own indexes, rotated)
-  - name: google
-    engine: google
-    shortcut: g
-    disabled: false
-
-  - name: startpage
-    engine: startpage
-    shortcut: sp
-    disabled: false
-
+  # R1 (2026-10-13, anti-blocking investigation doc — searx.space cross-check
+  # of 94 independent public SearXNG instances): google/startpage/duckduckgo/
+  # qwant/yahoo/mojeek/brave scrapers are 77-96% broken GLOBALLY (not a local
+  # IP block — no networking change on our end fixes a global failure
+  # pattern). Disabled below and replaced by the six engines verified LIVE
+  # against our own egress IP on 2026-10-13: bing, yandex, "google cse"
+  # (enabled by upstream defaults, no entry needed here — see router.go),
+  # mwmbl, yep, wiby. Brave is covered instead by our own `braveapi`-style
+  # adapter in the Go router's provider/tier waterfall (R4), not SearXNG's
+  # dead scraper.
   - name: bing
     engine: bing
     shortcut: b
     disabled: false
-
-  - name: duckduckgo
-    engine: duckduckgo
-    shortcut: ddg
-    disabled: false
-
-  - name: yahoo
-    engine: yahoo
-    shortcut: yh
-    disabled: false
-
-  - name: brave
-    engine: brave
-    shortcut: br
-    disabled: false
+    retry_on_http_error: [403, 429] # each retry uses a different proxy/source ip (outgoing.retries)
 
   - name: yandex
     engine: yandex
     shortcut: yx
     disabled: false
+    # safesearch is NOT implemented by this engine — the `hostnames` plugin
+    # above is what actually filters its output.
 
+  - name: mwmbl
+    engine: mwmbl
+    shortcut: mwm
+    disabled: false
+
+  - name: yep
+    engine: yep
+    shortcut: yep
+    disabled: false
+
+  - name: wiby
+    engine: wiby
+    shortcut: wib
+    disabled: false
+
+  # --- globally broken (84-96% error across 94 public SearXNG instances,
+  #     searx.space 2026-10-13). Kept as explicit entries (disabled) so a
+  #     future re-measurement doesn't have to re-declare them from scratch. ---
+  - name: google
+    engine: google
+    shortcut: g
+    disabled: true
+  - name: startpage
+    engine: startpage
+    shortcut: sp
+    disabled: true
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    disabled: true
+  - name: yahoo
+    engine: yahoo
+    shortcut: yh
+    disabled: true
+  - name: brave
+    engine: brave
+    shortcut: br
+    disabled: true
   - name: qwant
     engine: qwant
     shortcut: qw
-    disabled: false
-
+    disabled: true
   - name: mojeek
     engine: mojeek
     shortcut: mjk
-    disabled: false
+    disabled: true
 
   # Encyclopedic/structured — NOT general web. Disabled for web search because
   # they inject low-yield/off-topic "trash" results (Wikidata entities, etc.).
@@ -158,3 +176,6 @@ outgoing:
   retries: 2
   pool_connections: 100
   pool_maxsize: 20
+  # R1: goodwill with the small, API-first indexes (mwmbl/yep/wiby). Docs:
+  # "Contact info here may be useful to avoid an engine blocking you."
+  useragent_suffix: "self-hosted; admin@betamaxgroup.tech"
