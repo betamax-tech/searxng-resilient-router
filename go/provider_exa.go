@@ -69,6 +69,11 @@ func (p *ExaProvider) Search(ctx context.Context, query string, params url.Value
 		return ProviderResult{StatusCode: resp.StatusCode, Err: fmt.Sprintf("http_%d", resp.StatusCode), LatencyMS: lat}
 	}
 
+	// costDollars is a NESTED object in the live API (verified 2026-10-13:
+	// {"total": 0.007, "search": {"neural": 0.007}, ...}), not a bare number
+	// as a first reading of the docs might suggest — decoding it as *float64
+	// silently fails the whole Unmarshal() and was caught during live
+	// verification. `total` is the field that matters for cap tracking.
 	var doc struct {
 		Results []struct {
 			URL        string   `json:"url"`
@@ -76,7 +81,9 @@ func (p *ExaProvider) Search(ctx context.Context, query string, params url.Value
 			Highlights []string `json:"highlights"`
 			Text       string   `json:"text"`
 		} `json:"results"`
-		CostDollars *float64 `json:"costDollars"`
+		CostDollars *struct {
+			Total float64 `json:"total"`
+		} `json:"costDollars"`
 	}
 	if err := json.Unmarshal(body, &doc); err != nil {
 		return ProviderResult{StatusCode: resp.StatusCode, Err: "bad_json", LatencyMS: lat}
@@ -94,7 +101,7 @@ func (p *ExaProvider) Search(ctx context.Context, query string, params url.Value
 	pr := ProviderResult{Results: out, StatusCode: resp.StatusCode, LatencyMS: lat}
 	if doc.CostDollars != nil {
 		pr.CostKnown = true
-		pr.CostDollars = *doc.CostDollars
+		pr.CostDollars = doc.CostDollars.Total
 	}
 	return pr
 }
