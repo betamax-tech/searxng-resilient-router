@@ -47,6 +47,130 @@ then `systemctl --user restart searxng-router`.
 
 ---
 
+## Provider/tier waterfall (2026-10-13)
+
+The router now sits in front of **SearXNG plus four paid providers** (Exa,
+Tavily, Brave, TinyFish), chosen per query via an optional `tier=` param
+(or `X-Search-Tier` header): `crucial` | `standard` | `bulk`, default
+`standard`. **Callers that already pick their own engines
+(`engines=`/`engine=` param, a SearXNG `!bang`, or a non-`general`
+`categories=`) are untouched** — they keep exactly today's direct→proxied
+SearXNG behavior (the P2/P3 fixes). Everything else is tier-classified and
+routed through a provider waterfall where SearXNG itself is one stop among
+several.
+
+### Tier classification (rules only, no model)
+
+A query is forced to **`crucial`**, overriding whatever `tier=` was
+requested, when it contains a PH legal citation pattern (`G.R. No.`,
+`A.M. No.`, `A.C. No.`, `MTJ-`, `RTJ-`, `Republic Act No.`, `R.A. No.`) or a
+`site:` filter targeting `lawphil.net`, `elibrary.judiciary.gov.ph`,
+`sc.judiciary.gov.ph`, `officialgazette.gov.ph`, or `chanrobles.com`. See
+`go/tiers.go` → `classifyTier()`. The rule that fired is surfaced as
+`router_tier_rule` in the response and in the analytics log.
+
+A **shadow classifier hook** (`go/tiers.go` → `ShadowClassifier`) exists for
+a *future* ML/heuristic tier suggestion, logged next to the rules-based
+tier for comparison — it is `nil` today and never influences routing. No
+model is wired in this codebase.
+
+### Provider order per tier — DATA, not code
+
+`config/tier_providers.json` (re-read fresh on every request — edit and the
+next request picks it up, no rebuild/restart needed):
+
+```json
+{
+  "crucial":  ["exa", "tavily", "tinyfish", "brave", "searxng"],
+  "standard": ["tinyfish", "searxng", "brave", "exa"],
+  "bulk":     ["searxng", "tinyfish"]
+}
+```
+
+Failover happens on error, 429/timeout, an empty result set, OR a
+provider's cap being reached — see `go/tiered_router.go`. The failed-over
+chain is returned to the caller as `router_failovers` and logged.
+`"searxng"` is a special provider name that delegates to the existing
+`handleSearch()` direct→proxied logic (nothing about that logic changed).
+
+### Hard spend caps — "zero expenditure, ever"
+
+Every paid provider has a hard, disk-persisted cap at ~90% of its free
+allowance, enforced in `go/caps.go` **before** any call is made:
+
+| Provider | Cap | Mode | Why |
+|---|---|---|---|
+| Exa | $9.00/month | cost (actual `costDollars`) | $10 free credit/mo, resets 1st, no card |
+| Tavily | 900/month | count | 1,000 free credits/mo, no card |
+| Brave | 900/month | count | $5 free credit/mo ≈ 1,000 req; **card on file — overage WOULD bill** |
+| TinyFish | 10,800/day, 450/hr, 25/min | count | free ≤12,000/day, 30/min, 500/hr |
+
+If usage can't be determined — a corrupt on-disk cap file, or a cost-mode
+provider that returns HTTP 200 without a usable cost field — the limiter
+**fails closed**: either every provider is blocked (corrupt state) or that
+one provider is saturated for the rest of the period. Usage is recorded for
+**any confirmed HTTP 200 response**, even one this router failed to parse
+or that legitimately found zero results — a billed call must never go
+untracked. State lives at `cache/provider_caps.json` (gitignored,
+atomic writes, survives restarts). See it live at `GET /stats` →
+`provider_caps`.
+
+### Cache
+
+Identical `(normalized query, tier, categories/language/safesearch/pageno)`
+requests are served from disk for 24h, capped at 256MB total
+(`cache/search/`, gitignored, oldest-evicted-first). See `go/searchcache.go`.
+
+### Analytics / `/stats`
+
+Every tiered request logs one JSON line (same daily-rotated file under
+`cache/analytics/`) with `search_tier`, `tier_rule`, `shadow_tier`,
+`provider_used`, `providers_tried`, `failovers`, `cost_usd`, `cache_hit` —
+see `go/analytics.go` → `recordTieredEvent()`. `GET /stats` now also
+includes `provider_caps`: usage vs cap, per provider, per period.
+
+### Keys
+
+`EXA_API_KEY`, `TAVILY_API_KEY`, `TINYFISH_API_KEY`, `BRAVE_API_KEY` live in
+`.env` (gitignored) and are loaded by the systemd unit via
+`EnvironmentFile=/home/cmark/server/searxng-rotation/.env`. Never logged,
+never committed.
+
+---
+
+## R1/R2 (2026-10-13 anti-blocking investigation) — engine retune + proxy tier retirement
+
+**R1 — only the six engines verified live, globally-broken scrapers
+disabled.** A 94-public-instance cross-check (searx.space) showed
+startpage/duckduckgo/qwant/yahoo/mojeek/brave/google scrapers are 77-96%
+broken **globally**, not just for us. `searxng/settings.yml` and
+`settings.proxied.yml` now enable only `bing`, `yandex`, `google cse`
+(upstream default), `mwmbl`, `yep`, `wiby`; the dead six are kept as
+explicit `disabled: true` entries. `go/router.go`'s `engineFamilies` /
+`independentPool` / `engineRateDefaults` match. Brave's web index is now
+reached through the Go router's own `braveapi`-style adapter (provider
+waterfall above), not SearXNG's dead scraper.
+
+**R2 — the free rotating-proxy tier is retired.** It recovered zero
+engines, *lost* a working Yandex, and exposed every legal-research query to
+20 anonymous third parties. `searxng-router.service` now sets
+`ROUTER_DIRECT_ONLY=1`, pinning all SearXNG-tier traffic to the direct
+instance; `searxng-proxypool.timer` has been `disable --now`'d. **The code
+is untouched** (`go/proxypool.go`, `go/build.sh`'s proxypool build target) —
+to re-enable:
+
+```bash
+# 1. Remove (or set to 0/false) ROUTER_DIRECT_ONLY in systemd/searxng-router.service
+#    and ~/.config/systemd/user/searxng-router.service, then:
+systemctl --user daemon-reload
+systemctl --user restart searxng-router.service
+
+# 2. Resume proxy pool refresh:
+systemctl --user enable --now searxng-proxypool.timer
+```
+
+---
+
 ## Why this exists (original design notes)
 
 A plain self-hosted SearXNG on a datacenter IP breaks in three ways:
@@ -145,8 +269,11 @@ docker compose -f ../searxng/docker-compose.yml restart searxng-proxied
 cp ../systemd/* ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now searxng-router.service
-systemctl --user enable --now searxng-proxypool.timer
-systemctl --user enable --now searxng-deadletter.timer
+# NOTE (R2, 2026-10-13): the free-proxy tier is RETIRED by default —
+# searxng-router.service ships with ROUTER_DIRECT_ONLY=1. Do NOT enable
+# searxng-proxypool.timer on a fresh install unless you've deliberately
+# re-enabled the proxy tier (see "R1/R2" section above for why, and how).
+systemctl --user enable --now searxng-health-canary.timer
 # survive logout:
 loginctl enable-linger "$USER"
 ```
