@@ -11,8 +11,19 @@ Restart=always
 RestartSec=3
 # Resource guards (host is RAM-tight)
 MemoryMax=64M
+# Paid provider keys (EXA_API_KEY, TAVILY_API_KEY, TINYFISH_API_KEY,
+# BRAVE_API_KEY) — gitignored, never logged. Required for the
+# tier=crucial|standard|bulk provider waterfall (go/tiered_router.go).
+EnvironmentFile=/home/cmark/server/searxng-rotation/.env
 Environment=DEADLETTER_DIR=/home/cmark/server/searxng-rotation/cache/deadletter
 Environment=ROUTER_BIND_ADDRS=127.0.0.1:8899,172.17.0.1:8899,100.90.81.5:8899
+# R2 (2026-10-13, anti-blocking investigation doc): the free rotating-proxy
+# tier (:8891) recovered ZERO engines, LOST yandex, and exposed every legal-
+# research query to 20 anonymous third parties — retired. Direct-only mode
+# pins ALL searches to the direct instance; :8891 stays up as an identical-
+# config warm spare. To re-enable: remove this line (or set to 0/false) AND
+# `systemctl --user enable --now searxng-proxypool.timer` (see README).
+Environment=ROUTER_DIRECT_ONLY=1
 
 [Install]
 WantedBy=default.target
