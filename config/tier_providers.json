@@ -1,0 +1,6 @@
+{
+  "_comment": "Provider waterfall order per search tier. DATA, not code — edit and restart (or just wait: the router re-reads this file on every request) to re-tune without a rebuild. 'searxng' delegates to the router's existing direct/proxied SearXNG logic.",
+  "crucial": ["exa", "tavily", "tinyfish", "brave", "searxng"],
+  "standard": ["tinyfish", "searxng", "brave", "exa"],
+  "bulk": ["searxng", "tinyfish"]
+}
