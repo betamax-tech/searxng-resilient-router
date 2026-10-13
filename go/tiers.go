@@ -119,13 +119,32 @@ var tierProviderOrderFile = envOr("TIER_PROVIDER_ORDER_FILE",
 // of bytes) so an operator edit takes effect on the NEXT request, no restart
 // needed. Any tier missing from the file falls back to the built-in default
 // for that tier; a missing/invalid file falls back entirely to defaults.
+//
+// Decoding is deliberately LENIENT (field-by-field, via json.RawMessage)
+// rather than a single strict map[string][]string unmarshal: the config
+// file is meant to be hand-edited by operators and may contain non-array
+// bookkeeping fields (e.g. "_comment") that would otherwise fail the WHOLE
+// unmarshal and silently fall back to defaults — exactly the failure caught
+// during live verification (2026-10-13) when a "_comment" string field
+// broke parsing entirely.
 func loadTierProviderOrder(path string) tierProviderOrder {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return defaultTierProviderOrder
 	}
-	var m tierProviderOrder
-	if err := json.Unmarshal(b, &m); err != nil || len(m) == 0 {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil || len(raw) == 0 {
+		return defaultTierProviderOrder
+	}
+	m := tierProviderOrder{}
+	for key, v := range raw {
+		var order []string
+		if err := json.Unmarshal(v, &order); err != nil {
+			continue // not a string array (e.g. "_comment") — skip, not fatal
+		}
+		m[key] = order
+	}
+	if len(m) == 0 {
 		return defaultTierProviderOrder
 	}
 	for tier, order := range defaultTierProviderOrder {

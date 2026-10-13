@@ -161,6 +161,31 @@ func TestLoadTierProviderOrder_FileOverridesOrder(t *testing.T) {
 	}
 }
 
+// Regression (caught during live verification, 2026-10-13): the shipped
+// config/tier_providers.json includes a non-array "_comment" string field
+// for human readability. A strict map[string][]string unmarshal fails on
+// that field and silently falls back to DEFAULTS, which looked like the
+// file was being ignored entirely — the exact symptom observed live when a
+// smoke-test re-order of "standard" never took effect.
+func TestLoadTierProviderOrder_IgnoresNonArrayCommentField(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tier_providers.json")
+	withComment := `{
+		"_comment": "human-readable note, not a provider list",
+		"standard": ["brave"]
+	}`
+	if err := os.WriteFile(path, []byte(withComment), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	order := loadTierProviderOrder(path)
+	if len(order[TierStandard]) != 1 || order[TierStandard][0] != "brave" {
+		t.Fatalf("expected _comment to be skipped and standard=[brave] honored, got %v", order[TierStandard])
+	}
+	// Tiers not in the file still fall back to defaults.
+	if order[TierCrucial][0] != "exa" {
+		t.Errorf("expected crucial to fall back to default, got %v", order[TierCrucial])
+	}
+}
+
 func TestLoadTierProviderOrder_InvalidJSONFallsBackToDefaults(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tier_providers.json")
 	if err := os.WriteFile(path, []byte("{not valid"), 0o644); err != nil {
