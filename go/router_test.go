@@ -80,33 +80,64 @@ func TestDecideRotation(t *testing.T) {
 	}
 }
 
-// P4: the dead `google` scraper hot-spare must be gone from engineFamilies,
-// replaced by `startpage` (which is actually enabled on :8890 and proxies
-// Google's index), so the family still contributes a result when `google cse`'s
-// daily quota is spent.
-func TestEngineFamiliesGoogleSpareIsStartpageNotDeadGoogle(t *testing.T) {
-	sawStartpage := false
+// R1 (2026-10-13, anti-blocking investigation doc): engineFamilies and
+// independentPool must contain ONLY the six engines verified live against
+// our egress IP (bing, yandex, "google cse", mwmbl, yep, wiby). The scrapers
+// measured 84-96% broken across 94 public SearXNG instances on searx.space
+// (duckduckgo, startpage, qwant, yahoo, mojeek, brave, and the dead `google`
+// HTML scraper) must never appear here — including `startpage`, which R1
+// itself retires (superseding the earlier P4 fix that had relied on it as a
+// hot-spare). Every referenced engine must also carry a rate budget, or
+// selectEngines() silently treats it as nil and the family/pool contributes
+// nothing when exhausted — the exact P4 regression this guards against.
+func TestEngineFamiliesAndIndependentsOnlyLiveR1Engines(t *testing.T) {
+	deadEngines := map[string]bool{
+		"google": true, "duckduckgo": true, "startpage": true,
+		"qwant": true, "yahoo": true, "mojeek": true, "brave": true,
+	}
+	liveEngines := map[string]bool{
+		"google cse": true, "bing": true, "yandex": true,
+		"mwmbl": true, "yep": true, "wiby": true,
+	}
+
+	var all []string
+	for _, fam := range engineFamilies {
+		all = append(all, fam...)
+	}
+	all = append(all, independentPool...)
+
+	for _, name := range all {
+		if deadEngines[name] {
+			t.Errorf("globally-broken engine %q still referenced in engineFamilies/independentPool", name)
+		}
+		if !liveEngines[name] {
+			t.Errorf("engine %q is not one of the R1 verified-live engines", name)
+		}
+		if _, ok := engineRateDefaults[name]; !ok {
+			t.Errorf("engine %q has no engineRateDefaults budget -> dead weight", name)
+		}
+	}
+
+	// bing and "google cse" must still be the two primary families (each its
+	// own index); yandex/mwmbl/yep/wiby rotate as independents.
+	foundBing, foundGoogleCSE := false, false
 	for _, fam := range engineFamilies {
 		for _, name := range fam {
-			if name == "google" {
-				t.Errorf("dead `google` scraper hot-spare still present in engineFamilies: %v", fam)
+			if name == "bing" {
+				foundBing = true
 			}
-			if name == "startpage" {
-				sawStartpage = true
+			if name == "google cse" {
+				foundGoogleCSE = true
 			}
 		}
 	}
-	if !sawStartpage {
-		t.Errorf("expected `startpage` hot-spare somewhere in engineFamilies, got %v", engineFamilies)
+	if !foundBing || !foundGoogleCSE {
+		t.Errorf("expected bing and `google cse` as engineFamilies primaries, got %v", engineFamilies)
 	}
-	// Every engine referenced by a family must have a rate budget, or
-	// selectEngines() silently treats it as nil and the family contributes
-	// nothing when its primary is exhausted — the exact P4 bug with `google`.
-	for _, fam := range engineFamilies {
-		for _, name := range fam {
-			if _, ok := engineRateDefaults[name]; !ok {
-				t.Errorf("engineFamilies member %q has no engineRateDefaults budget -> dead weight", name)
-			}
-		}
+}
+
+func TestIndependentsPerQueryMatchesPoolDiversity(t *testing.T) {
+	if independentsPerQuery < 1 || independentsPerQuery > len(independentPool) {
+		t.Errorf("independentsPerQuery=%d out of range for pool size %d", independentsPerQuery, len(independentPool))
 	}
 }

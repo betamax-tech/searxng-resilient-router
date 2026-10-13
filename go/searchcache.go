@@ -97,6 +97,11 @@ func (c *DiskCache) Set(key string, body []byte) {
 	c.enforceSizeCapLocked()
 }
 
+// enforceSizeCapLocked evicts the oldest entries until the directory is
+// under maxBytes. "Oldest" is read from each entry's own stored_at content
+// field (set by Set() via c.now()), NOT the filesystem mtime — this makes
+// eviction order deterministic under the injectable clock used by tests,
+// and immune to filesystem mtime-resolution ties on rapid successive writes.
 func (c *DiskCache) enforceSizeCapLocked() {
 	if c.maxBytes <= 0 {
 		return
@@ -106,9 +111,9 @@ func (c *DiskCache) enforceSizeCapLocked() {
 		return
 	}
 	type fi struct {
-		path string
-		size int64
-		mod  time.Time
+		path     string
+		size     int64
+		storedAt int64
 	}
 	var files []fi
 	var total int64
@@ -116,17 +121,25 @@ func (c *DiskCache) enforceSizeCapLocked() {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
 			continue
 		}
+		p := filepath.Join(c.dir, e.Name())
 		info, err := e.Info()
 		if err != nil {
 			continue
 		}
-		files = append(files, fi{filepath.Join(c.dir, e.Name()), info.Size(), info.ModTime()})
+		storedAt := info.ModTime().Unix() // fallback if content can't be read
+		if b, err := os.ReadFile(p); err == nil {
+			var cf cacheFile
+			if json.Unmarshal(b, &cf) == nil {
+				storedAt = cf.StoredAt
+			}
+		}
+		files = append(files, fi{p, info.Size(), storedAt})
 		total += info.Size()
 	}
 	if total <= c.maxBytes {
 		return
 	}
-	sort.Slice(files, func(i, j int) bool { return files[i].mod.Before(files[j].mod) })
+	sort.Slice(files, func(i, j int) bool { return files[i].storedAt < files[j].storedAt })
 	for _, f := range files {
 		if total <= c.maxBytes {
 			break

@@ -22,15 +22,25 @@ var analyticsDir = envOr("ANALYTICS_DIR", "/home/cmark/server/searxng-rotation/c
 
 // ---- event record (one JSON line per request) ----
 type searchEvent struct {
-	TS          string              `json:"ts"`
-	Query       string              `json:"query"`
-	Tier        string              `json:"tier"`   // direct | proxied | none
-	Engines     string              `json:"engines"` // engines= we sent (rotation)
-	Results     int                 `json:"results"`
-	Status      int                 `json:"status"` // upstream HTTP status
-	LatencyMS   int64               `json:"latency_ms"`
-	Unresponsive []unresponsiveEng  `json:"unresponsive,omitempty"`
-	Outcome     string              `json:"outcome"` // ok | empty | deadletter
+	TS           string            `json:"ts"`
+	Query        string            `json:"query"`
+	Tier         string            `json:"tier"`    // direct | proxied | none (SearXNG upstream tier)
+	Engines      string            `json:"engines"` // engines= we sent (rotation)
+	Results      int               `json:"results"`
+	Status       int               `json:"status"` // upstream HTTP status
+	LatencyMS    int64             `json:"latency_ms"`
+	Unresponsive []unresponsiveEng `json:"unresponsive,omitempty"`
+	Outcome      string            `json:"outcome"` // ok | empty | deadletter | exhausted
+
+	// --- provider/tier fields (task: tier=crucial|standard|bulk waterfall) ---
+	SearchTier     string         `json:"search_tier,omitempty"`     // crucial | standard | bulk
+	TierRule       string         `json:"tier_rule,omitempty"`       // which rule set SearchTier
+	ShadowTier     string         `json:"shadow_tier,omitempty"`     // future-classifier suggestion, logged only (no-op today)
+	ProviderUsed   string         `json:"provider_used,omitempty"`   // provider (or "searxng"/"cache") that answered
+	ProvidersTried []string       `json:"providers_tried,omitempty"` // full waterfall order attempted
+	Failovers      []failoverStep `json:"failovers,omitempty"`       // {provider, reason} for every skipped/failed stop
+	CostUSD        float64        `json:"cost_usd,omitempty"`        // actual recorded cost (Exa only; 0 for count-mode/free)
+	CacheHit       bool           `json:"cache_hit,omitempty"`
 }
 
 type unresponsiveEng struct {
@@ -40,21 +50,21 @@ type unresponsiveEng struct {
 
 // ---- in-memory counters (since boot) ----
 type engineStat struct {
-	Requests     int64  `json:"requests"`      // times we sent this engine
-	Suspensions  int64  `json:"suspensions"`   // times it appeared in unresponsive
-	LastSuspend  string `json:"last_suspend,omitempty"`
-	LastReason   string `json:"last_reason,omitempty"`
+	Requests    int64  `json:"requests"`    // times we sent this engine
+	Suspensions int64  `json:"suspensions"` // times it appeared in unresponsive
+	LastSuspend string `json:"last_suspend,omitempty"`
+	LastReason  string `json:"last_reason,omitempty"`
 }
 
 var (
-	statMu       sync.Mutex
-	statStart    = time.Now()
-	totalReqs    int64
-	deadletters  int64
-	engineStats  = map[string]*engineStat{}
-	lastReqAt    time.Time
-	gapSumMS     int64 // sum of inter-request gaps (for avg burst spacing)
-	gapCount     int64
+	statMu      sync.Mutex
+	statStart   = time.Now()
+	totalReqs   int64
+	deadletters int64
+	engineStats = map[string]*engineStat{}
+	lastReqAt   time.Time
+	gapSumMS    int64 // sum of inter-request gaps (for avg burst spacing)
+	gapCount    int64
 
 	evMu   sync.Mutex
 	evFile *os.File
@@ -127,6 +137,26 @@ func recordEvent(ev searchEvent) {
 	appendEvent(ev)
 }
 
+// recordTieredEvent logs one provider/tier waterfall decision (one per
+// inbound /search request routed through handleTieredSearch), distinct from
+// the per-upstream-attempt events recordEvent() already logs inside
+// handleSearch()'s direct/proxied tiers — each layer logs its own grain.
+func recordTieredEvent(query, tier, rule, shadow, providerUsed string, tried []string,
+	failovers []failoverStep, costUSD float64, cacheHit bool) {
+	outcome := "exhausted"
+	if cacheHit {
+		outcome = "cache_hit"
+	} else if providerUsed != "" {
+		outcome = "ok"
+	}
+	recordEvent(searchEvent{
+		TS: time.Now().UTC().Format(time.RFC3339Nano), Query: query, Tier: "n/a",
+		SearchTier: tier, TierRule: rule, ShadowTier: shadow,
+		ProviderUsed: providerUsed, ProvidersTried: tried, Failovers: failovers,
+		CostUSD: costUSD, CacheHit: cacheHit, Outcome: outcome,
+	})
+}
+
 func isSuspension(reason string) bool {
 	r := strings.ToLower(reason)
 	return strings.Contains(r, "suspend") || strings.Contains(r, "too many") ||
@@ -181,11 +211,12 @@ func statsSnapshot() map[string]any {
 		engs[name] = *s
 	}
 	return map[string]any{
-		"uptime_seconds":      int(uptime),
-		"total_requests":      totalReqs,
-		"requests_per_min":    reqPerMin,
-		"deadletters":         deadletters,
-		"avg_request_gap_ms":  int(avgGap),
-		"engines":             engs,
+		"uptime_seconds":     int(uptime),
+		"total_requests":     totalReqs,
+		"requests_per_min":   reqPerMin,
+		"deadletters":        deadletters,
+		"avg_request_gap_ms": int(avgGap),
+		"engines":            engs,
+		"provider_caps":      capLimiter.Snapshot(),
 	}
 }

@@ -45,7 +45,7 @@ const (
 	direct     = "http://127.0.0.1:8890"
 	proxied    = "http://127.0.0.1:8891"
 
-	directMax      = 2                // concurrent direct searches before spilling
+	directMax      = 2 // concurrent direct searches before spilling
 	cooldown       = 180 * time.Second
 	directTimeout  = 20 * time.Second
 	proxiedTimeout = 45 * time.Second
@@ -65,7 +65,6 @@ const (
 
 	activePoolFile = "/home/cmark/server/searxng-rotation/cache/active_pool.json"
 )
-
 
 // defaultDirectOnly pins ALL searches to the direct tier (no proxy spillover)
 // when ROUTER_DIRECT_ONLY is truthy. Per-request ?direct= overrides this.
@@ -200,61 +199,57 @@ func envOr(k, def string) string {
 // ROUTER_ENGINE_RATE_GOOGLE=5). Researched tolerance defaults below.
 
 type engineDef struct {
-	name       string
-	perMin     float64
-	bucket     *tokenBucket
+	name   string
+	perMin float64
+	bucket *tokenBucket
 }
 
 // index families: pick ONE available member per family per query (order = preference).
 //
 // IMPORTANT: these names must match engines that are ENABLED and actually RETURN
-// results on THIS SearXNG instance from our datacenter IP. Measured 2026-07-22
-// against the direct instance (:8890), isolated per-engine queries:
-//
-//     google cse  -> 20  (Google's JSON *API* — reliable, but ~100 queries/DAY cap)
-//     google      -> 39  (scraper — high yield but FLAKY: frequently CAPTCHA'd to 0)
-//     duckduckgo  -> 10  (works)
-//     bing        -> 10  (works, most tolerant)
-//     yandex      -> 10  (works)
-//     startpage / brave / qwant / mojeek / yahoo -> 0  (blocked or not usable here)
-//
-// The previous list asked for `google` (flaky scraper, not the API) and the five
-// dead engines, and never asked for `google cse` or `duckduckgo` — so a rotated
-// query kept collapsing to bing-only (~10 junk results). Families below use the
-// engines that work; `google cse` is preferred for Google's index with the
-// `google` scraper as a hot-spare, and bing/duckduckgo rotate for Bing's index.
+// results on THIS SearXNG instance from our egress IP — see the README's
+// "re-measure if quality regresses" note. History: a 2026-07-22 measurement
+// first replaced a stale all-dead list; a 2026-10-13 P4 fix then swapped a
+// dead `google` hot-spare for `startpage`. Both are superseded by R1 below,
+// which cross-checked against 94 independent public SearXNG instances
+// (searx.space) rather than just our own box, and found the failures are
+// GLOBAL (not a local block any networking change could fix).
 // To retune budgets without a rebuild, set ROUTER_ENGINE_RATE_<NAME> (uppercased;
 // note "google cse" has a space and so cannot be overridden via env — edit here).
 //
-// P4 (2026-10-13): the "google" scraper hot-spare below was DEAD WEIGHT — it is
-// not in `/config`'s enabled engine list on :8890 despite `disabled: false` in
-// settings.yml, so when `google cse`'s ~100/day quota trips (it does, every
-// day), the family silently contributed nothing. Swapped for `startpage`, which
-// actually proxies Google's index and IS enabled; it gets CAPTCHA'd sometimes
-// too, but self-heals within ~2min via ban_time_on_fail, unlike `google` which
-// structurally never works on this instance. Re-measure per README's own
-// 2026-07-22-style note if quality regresses again.
+// R1 (2026-10-13, anti-blocking investigation doc — searx.space cross-check
+// of 94 public SearXNG instances): startpage/duckduckgo/qwant/yahoo/mojeek/
+// brave and the `google` HTML scraper are 77-96% broken GLOBALLY, not just
+// for us — no networking change on our end fixes a global failure pattern.
+// Replaced with the six engines verified LIVE from this egress on
+// 2026-10-13: bing, yandex, "google cse", mwmbl, yep, wiby. This SUPERSEDES
+// the P4 fix (which had swapped the dead `google` hot-spare for `startpage`
+// — startpage itself is now retired too, 96% broken on searx.space).
 var engineFamilies = [][]string{
-	{"google cse", "startpage"}, // Google's index — cse (API, reliable) preferred; startpage proxies Google when cse is spent
-	{"bing", "duckduckgo"},      // Bing's index (ddg re-serves Bing) — rotate to avoid hammering one
+	{"google cse"}, // Google's index — the only reliable member; no live hot-spare exists (startpage retired, R1)
+	{"bing"},       // Bing's index — most tolerant scraper we have; duckduckgo (93% broken) retired
 }
 
-// independent pool: rotated, up to independentsPerQuery picked per query by most-tokens
-var independentPool = []string{"yandex"}
+// independent pool: rotated, up to independentsPerQuery picked per query by
+// most-tokens. yandex plus three small-but-live indexes added by R1 (24/20/1
+// results on the 2026-10-13 probe respectively) so independent coverage no
+// longer rests on yandex alone.
+var independentPool = []string{"yandex", "mwmbl", "yep", "wiby"}
 
-const independentsPerQuery = 1
+const independentsPerQuery = 2 // was 1 — more diversity now that the pool is real (R1)
 
-// tolerance-based default budgets (requests/min per engine from a datacenter IP).
-// "google cse" is API-key based (no per-request block, but a hard ~100/DAY free
-// quota the router can't count) so keep it modest; when its per-min budget is
-// spent the family falls back to `startpage`, conserving the daily cap. "google"
-// has no budget entry (P4): it's not enabled on this instance, so a budget for
-// it would be dead weight — see engineFamilies comment above.
+// tolerance-based default budgets (requests/min per engine from a
+// datacenter IP). "google cse" is API-key based (no per-request block, but a
+// hard ~100/DAY free quota the router can't count) so keep it modest.
+// mwmbl/yep/wiby are small, crowd-curated/own-index engines with no observed
+// hostile rate limiting — budgets per R1.
 var engineRateDefaults = map[string]float64{
 	"google cse": 5,
-	"startpage":  6,
-	"bing":       12, "duckduckgo": 12,
-	"yandex": 8,
+	"bing":       12,
+	"yandex":     8,
+	"mwmbl":      10,
+	"yep":        10,
+	"wiby":       6,
 }
 
 var engines = func() map[string]*engineDef {
@@ -649,22 +644,50 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 	// 200 empty. Header `X-Router-Strict: 1` or `?strict=1`.
 	strict := r.Header.Get("X-Router-Strict") == "1" || params.Get("strict") == "1"
 	params.Del("strict")
-	log.Printf("search q=%q categories=%q", params.Get("q"), params.Get("categories"))
-	oc := handleSearch(params, strict)
 
-	// Router metadata as response headers (invisible to JSON parsers; safe).
-	if oc.enginesUsed != "" {
-		w.Header().Set("X-Router-Engines", oc.enginesUsed)
+	// Optional tier selector: `?tier=crucial|standard|bulk` or header
+	// `X-Search-Tier`. Stripped before any upstream call — it is router-only
+	// meta, same convention as strict/direct.
+	tierRequested := params.Get("tier")
+	if tierRequested == "" {
+		tierRequested = r.Header.Get("X-Search-Tier")
 	}
-	w.Header().Set("X-Router-Tier", oc.tier)
-	if len(oc.unresponsive) > 0 {
-		var names []string
-		for _, u := range oc.unresponsive {
-			names = append(names, u.Engine)
+	params.Del("tier")
+
+	query := params.Get("q")
+	log.Printf("search q=%q categories=%q tier=%q", query, params.Get("categories"), tierRequested)
+
+	// Callers that already picked their own engines (engines=/engine= param,
+	// a SearXNG !bang, or a non-general category) keep TODAY'S SearXNG-only
+	// behavior unchanged — the P2/P3 fixes must never be disturbed by the
+	// new provider/tier system.
+	if skipTierRouting(params, query) {
+		oc := handleSearch(params, strict)
+		if oc.enginesUsed != "" {
+			w.Header().Set("X-Router-Engines", oc.enginesUsed)
 		}
-		w.Header().Set("X-Router-Unresponsive", strings.Join(names, ","))
+		w.Header().Set("X-Router-Tier", oc.tier)
+		if len(oc.unresponsive) > 0 {
+			var names []string
+			for _, u := range oc.unresponsive {
+				names = append(names, u.Engine)
+			}
+			w.Header().Set("X-Router-Unresponsive", strings.Join(names, ","))
+		}
+		writeJSON(w, oc.status, oc.body)
+		return
 	}
-	writeJSON(w, oc.status, oc.body)
+
+	to := handleTieredSearch(params, tierRequested, strict)
+	w.Header().Set("X-Router-Search-Tier", to.searchTier)
+	w.Header().Set("X-Router-Tier-Rule", to.tierRule)
+	if to.providerUsed != "" {
+		w.Header().Set("X-Router-Provider-Used", to.providerUsed)
+	}
+	if to.cacheHit {
+		w.Header().Set("X-Router-Cache-Hit", "1")
+	}
+	writeJSON(w, to.status, to.body)
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
