@@ -1,6 +1,22 @@
 {
-  "_comment": "Provider waterfall order per search tier. DATA, not code — edit and restart (or just wait: the router re-reads this file on every request) to re-tune without a rebuild. 'searxng' delegates to the router's existing direct/proxied SearXNG logic.",
-  "crucial": ["exa", "tavily", "tinyfish", "brave", "searxng"],
-  "standard": ["tinyfish", "searxng", "brave", "exa"],
-  "bulk": ["searxng", "tinyfish"]
+  "_comment": "Provider waterfall order per search tier. DATA, not code \u2014 edit and restart (or just wait: the router re-reads this file on every request) to re-tune without a rebuild. 'searxng' delegates to the router's existing direct/proxied SearXNG logic.",
+  "crucial": [
+    "tinyfish",
+    "exa",
+    "tavily",
+    "searxng",
+    "brave"
+  ],
+  "standard": [
+    "tinyfish",
+    "exa",
+    "tavily",
+    "searxng",
+    "brave"
+  ],
+  "bulk": [
+    "searxng",
+    "tinyfish"
+  ],
+  "_benchmark": "Order from ph-legal-research eval/search-providers/2026-10-13 (30 PH legal queries): TinyFish best known-item hit@1 0.67, Exa best hit@3/10 0.83 + zero junk. Exa spends free credit (~$0.007/search), so it goes second to preserve it."
 }
