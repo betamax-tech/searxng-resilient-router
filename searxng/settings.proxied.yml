@@ -85,51 +85,66 @@ hostnames:
 
 engines:
   # All rotation engines enabled; router targets subsets via engines= per query.
-  # See settings.yml for the index-family rationale.
-  - name: google
-    engine: google
-    shortcut: g
-    disabled: false
-
-  - name: startpage
-    engine: startpage
-    shortcut: sp
-    disabled: false
-
+  # R1 (2026-10-13): mirrors settings.yml's live-engine retune — see that
+  # file for the full rationale. This instance is now a warm spare only (R2:
+  # the proxy tier is retired via ROUTER_DIRECT_ONLY=1 on the router), kept
+  # config-identical to the direct instance so it can resume real traffic
+  # immediately if the proxy tier is ever re-enabled.
   - name: bing
     engine: bing
     shortcut: b
     disabled: false
-
-  - name: duckduckgo
-    engine: duckduckgo
-    shortcut: ddg
-    disabled: false
-
-  - name: yahoo
-    engine: yahoo
-    shortcut: yh
-    disabled: false
-
-  - name: brave
-    engine: brave
-    shortcut: br
-    disabled: false
+    retry_on_http_error: [403, 429]
 
   - name: yandex
     engine: yandex
     shortcut: yx
     disabled: false
 
+  - name: mwmbl
+    engine: mwmbl
+    shortcut: mwm
+    disabled: false
+
+  - name: yep
+    engine: yep
+    shortcut: yep
+    disabled: false
+
+  - name: wiby
+    engine: wiby
+    shortcut: wib
+    disabled: false
+
+  # --- globally broken (searx.space 2026-10-13) — see settings.yml ---
+  - name: google
+    engine: google
+    shortcut: g
+    disabled: true
+  - name: startpage
+    engine: startpage
+    shortcut: sp
+    disabled: true
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    disabled: true
+  - name: yahoo
+    engine: yahoo
+    shortcut: yh
+    disabled: true
+  - name: brave
+    engine: brave
+    shortcut: br
+    disabled: true
   - name: qwant
     engine: qwant
     shortcut: qw
-    disabled: false
-
+    disabled: true
   - name: mojeek
     engine: mojeek
     shortcut: mjk
-    disabled: false
+    disabled: true
 
   - name: wikipedia
     engine: wikipedia
@@ -148,7 +163,7 @@ engines:
 
 
 # >>> MANAGED PROXIES (proxy_pool) — do not edit by hand >>>
-# regenerated: 2026-10-12T15:31:02Z | 20 healthy proxies | SearXNG round-robins these
+# regenerated: 2026-10-13T04:32:21Z | 20 healthy proxies | SearXNG round-robins these
 outgoing:
   request_timeout: 6.0
   max_request_timeout: 15.0
@@ -159,25 +174,25 @@ outgoing:
   proxies:
     all://:
       - http://43.99.60.244:8089
-      - socks5h://43.156.84.41:10808
+      - socks5h://147.139.133.251:10080
+      - socks5h://116.101.14.169:1111
       - socks5h://183.106.215.208:1080
+      - socks5h://144.24.111.128:1088
       - http://203.252.142.217:80
-      - socks5h://65.20.79.228:40002
-      - socks5h://129.153.11.56:1080
-      - http://103.130.61.61:8081
-      - socks5h://102.129.229.131:1081
-      - socks5h://67.207.92.87:1088
-      - socks5h://38.49.210.79:40000
-      - socks5h://101.36.104.46:10808
-      - http://197.224.185.3:3128
-      - socks5h://8.219.122.8:9999
-      - socks5h://103.88.234.239:40017
-      - socks5h://103.100.158.115:10809
-      - socks5h://212.77.75.25:1088
-      - socks5h://171.25.158.95:1080
-      - socks5h://156.225.20.83:1080
-      - socks5h://45.74.31.42:20058
+      - socks5h://217.142.236.180:1080
+      - socks5h://2.50.191.180:10800
       - socks5h://101.36.104.239:10808
+      - http://197.224.185.3:3128
+      - socks5h://45.74.31.46:5729
+      - socks5h://42.112.52.16:20001
+      - socks5h://42.112.52.66:20001
+      - socks5h://42.112.52.40:20001
+      - socks5h://42.112.52.60:20001
+      - socks5h://118.179.93.24:9090
+      - socks5h://144.217.107.25:1080
+      - socks5h://45.74.31.46:6337
+      - socks5h://79.134.4.192:1080
+      - socks5h://42.112.52.62:20001
 # <<< MANAGED PROXIES (proxy_pool) <<<
 
 # --- Why this file remains `skip-worktree` (decision, 2026-10-13) ---
