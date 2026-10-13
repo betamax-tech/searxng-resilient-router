@@ -255,13 +255,14 @@ func TestHandleTieredSearch_StrictModeReturns503OnExhaustion(t *testing.T) {
 	}
 }
 
-// recordProviderUsage bridges a ProviderResult into the cap limiter
+// recordAttemptedCall bridges a ProviderResult into the cap limiter
 // correctly for both cost-mode (Exa) and count-mode (Brave/Tavily/TinyFish)
-// providers, including the fail-closed path when cost is unknown.
-func TestRecordProviderUsage(t *testing.T) {
+// providers, including the fail-closed path when cost is unknown. Only a
+// confirmed HTTP 200 response records usage.
+func TestRecordAttemptedCall(t *testing.T) {
 	withTestEnv(t)
 
-	recordProviderUsage("exa", ProviderResult{CostKnown: true, CostDollars: 1.23})
+	recordAttemptedCall("exa", ProviderResult{StatusCode: 200, CostKnown: true, CostDollars: 1.23})
 	snap := capLimiter.Snapshot()
 	windows := snap["windows"].(map[string]any)
 	exaWin := windows["exa_monthly"].(map[string]any)
@@ -269,9 +270,7 @@ func TestRecordProviderUsage(t *testing.T) {
 		t.Errorf("expected exa usage 1.23 after a known-cost call, got %v", used)
 	}
 
-	recordProviderUsage("brave", ProviderResult{}) // count-mode, no cost field needed
-	braveWin := windows["brave_monthly"].(map[string]any)
-	_ = braveWin // snapshot is a point-in-time copy; re-fetch for the real check
+	recordAttemptedCall("brave", ProviderResult{StatusCode: 200}) // count-mode, no cost field needed
 	snap2 := capLimiter.Snapshot()
 	braveWin2 := snap2["windows"].(map[string]any)["brave_monthly"].(map[string]any)
 	if used := braveWin2["used"].(float64); used != 1 {
@@ -279,15 +278,43 @@ func TestRecordProviderUsage(t *testing.T) {
 	}
 }
 
-func TestRecordProviderUsage_UnknownCostFailsClosed(t *testing.T) {
+func TestRecordAttemptedCall_UnknownCostFailsClosed(t *testing.T) {
 	withTestEnv(t)
-	recordProviderUsage("exa", ProviderResult{CostKnown: false}) // provider didn't report costDollars
+	recordAttemptedCall("exa", ProviderResult{StatusCode: 200, CostKnown: false}) // 200 but no costDollars
 	ok, reason := capLimiter.Allowed("exa")
 	if ok {
-		t.Fatalf("expected exa fail-closed after an unknown-cost call")
+		t.Fatalf("expected exa fail-closed after an unknown-cost 200 response")
 	}
 	if reason == "" {
 		t.Errorf("expected a non-empty fail-closed reason")
+	}
+}
+
+// Regression (caught during this task's own design review): a response
+// that failed to parse into usable results, or legitimately found zero
+// hits, STILL means the provider processed the request and may have
+// billed. Usage must be recorded in both cases, not just on the happy path
+// with non-empty results — otherwise repeated "empty/bad" queries could
+// burn real quota while the cap limiter believes nothing was spent.
+func TestRecordAttemptedCall_RecordsOnNon200OnlyStatusOK(t *testing.T) {
+	withTestEnv(t)
+
+	// Non-200 (e.g. rate_limited, network failure) -> NOT recorded.
+	recordAttemptedCall("brave", ProviderResult{StatusCode: 429, Err: "rate_limited"})
+	recordAttemptedCall("brave", ProviderResult{StatusCode: 0, Err: "request_failed"})
+	snap := capLimiter.Snapshot()
+	used := snap["windows"].(map[string]any)["brave_monthly"].(map[string]any)["used"].(float64)
+	if used != 0 {
+		t.Fatalf("expected 0 usage recorded for non-200 responses, got %v", used)
+	}
+
+	// 200 with bad_json / zero results -> IS recorded (the provider did work).
+	recordAttemptedCall("brave", ProviderResult{StatusCode: 200, Err: "bad_json"})
+	recordAttemptedCall("brave", ProviderResult{StatusCode: 200}) // empty results, no Err
+	snap2 := capLimiter.Snapshot()
+	used2 := snap2["windows"].(map[string]any)["brave_monthly"].(map[string]any)["used"].(float64)
+	if used2 != 2 {
+		t.Fatalf("expected 2 usage units recorded for the two 200 responses, got %v", used2)
 	}
 }
 

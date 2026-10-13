@@ -123,6 +123,14 @@ func handleTieredSearch(params url.Values, tierRequested string, strict bool) ti
 		res := p.Search(ctx, query, params)
 		cancel()
 
+		// Record usage for ANY confirmed HTTP 200 round trip, BEFORE looking
+		// at whether we could parse/use the result. A billed call must
+		// never go untracked — the exact gap caught during live
+		// verification (2026-10-13): a response Exa returned as HTTP 200
+		// that our JSON decoder then failed on would otherwise consume real
+		// quota on Exa's side while this router recorded zero spend.
+		recordAttemptedCall(prov, res)
+
 		if res.Err != "" {
 			log.Printf("  tier=%s provider=%s FAIL: %s", tier, prov, res.Err)
 			failovers = append(failovers, failoverStep{prov, res.Err})
@@ -132,10 +140,6 @@ func handleTieredSearch(params url.Values, tierRequested string, strict bool) ti
 			failovers = append(failovers, failoverStep{prov, "empty_results"})
 			continue
 		}
-
-		// Success: record cap usage BEFORE returning, so the spend is never
-		// lost even if something downstream errors.
-		recordProviderUsage(prov, res)
 
 		body := buildSearxBody(query, res.Results, tier, rule, shadow, prov, tried, failovers)
 		diskCache.Set(cacheKey, body)
@@ -159,11 +163,21 @@ func handleTieredSearch(params url.Values, tierRequested string, strict bool) ti
 		providersTried: tried, failovers: failovers}
 }
 
-// recordProviderUsage persists actual usage against the correct cap
-// window(s) immediately after a successful call. Cost-mode providers (Exa)
-// MUST report a real cost; if they don't, usage is UNKNOWN and the owner's
-// fail-closed rule applies (caps.go: RecordUnknownFailClosed).
-func recordProviderUsage(name string, res ProviderResult) {
+// recordAttemptedCall persists actual usage against the correct cap
+// window(s) for any CONFIRMED HTTP 200 response from a provider — a round
+// trip that reached the provider and got a normal response may have been
+// billed, regardless of whether this router could parse or use the result
+// (bad JSON, zero hits). Non-200 outcomes (network failure, timeout,
+// missing key, 429/rate-limited, 4xx/5xx) are NOT recorded: none of these
+// providers bill for a request their own infra rejected before doing work.
+//
+// Cost-mode providers (Exa) MUST report a real cost on every 200; if they
+// don't, usage is UNKNOWN and the owner's fail-closed rule applies
+// (caps.go: RecordUnknownFailClosed) rather than assuming $0.
+func recordAttemptedCall(name string, res ProviderResult) {
+	if res.StatusCode != http.StatusOK {
+		return
+	}
 	hasCost, hasCount := false, false
 	for _, d := range capWindowDefs {
 		if d.Provider != name {
@@ -180,7 +194,7 @@ func recordProviderUsage(name string, res ProviderResult) {
 		if res.CostKnown {
 			capLimiter.RecordCost(name, res.CostDollars)
 		} else {
-			capLimiter.RecordUnknownFailClosed(name, "provider_did_not_report_cost")
+			capLimiter.RecordUnknownFailClosed(name, "cost_unknown_after_200_response")
 		}
 	}
 	if hasCount {
